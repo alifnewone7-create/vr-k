@@ -1,0 +1,139 @@
+{
+  "product_name": "Telegram Ultra",
+  "product_tagline": "Next-Gen Telegram Userbot & Control Panel",
+  "design_archetype": "Performance Pro / Electric Cyber Control Center",
+  "theme": "Dark Mode First (with glassmorphism, glowing micro-accents, tactical precision)",
+  "color_palette": {
+    "dark": {
+      "background": "oklch(0.13 0.02 260)",
+      "foreground": "oklch(0.98 0.005 260)",
+      "card": "oklch(0.18 0.02 260)",
+      "card_foreground": "oklch(0.98 0.005 260)",
+      "popover": "oklch(0.18 0.02 260)",
+      "popover_foreground": "oklch(0.98 0.005 260)",
+      "primary": "oklch(0.64 0.20 245)",
+      "primary_foreground": "oklch(0.99 0 0)",
+      "secondary": "oklch(0.24 0.02 260)",
+      "secondary_foreground": "oklch(0.96 0.005 260)",
+      "muted": "oklch(0.22 0.015 260)",
+      "muted_foreground": "oklch(0.70 0.015 260)",
+      "accent": "oklch(0.26 0.03 250)",
+      "accent_foreground": "oklch(0.98 0.005 260)",
+      "destructive": "oklch(0.62 0.22 25)",
+      "destructive_foreground": "oklch(0.99 0 0)",
+      "border": "oklch(1 0 0 / 12%)",
+      "input": "oklch(1 0 0 / 15%)",
+      "ring": "oklch(0.64 0.20 245)",
+      "sidebar": "oklch(0.15 0.02 260)",
+      "sidebar_foreground": "oklch(0.98 0.005 260)",
+      "sidebar_primary": "oklch(0.64 0.20 245)",
+      "sidebar_primary_foreground": "oklch(0.99 0 0)",
+      "sidebar_accent": "oklch(0.24 0.03 250)",
+      "sidebar_accent_foreground": "oklch(0.98 0.005 260)",
+      "sidebar_border": "oklch(1 0 0 / 12%)",
+      "sidebar_ring": "oklch(0.64 0.20 245)",
+      "status_success": "oklch(0.72 0.20 155)",
+      "status_warning": "oklch(0.78 0.18 75)",
+      "status_error": "oklch(0.62 0.22 25)",
+      "status_info": "oklch(0.65 0.18 220)",
+      "gradient_glow": "radial-gradient(ellipse at top, oklch(0.64 0.20 245 / 15%), transparent 70%)"
+    },
+    "light": {
+      "background": "oklch(0.98 0.005 260)",
+      "foreground": "oklch(0.14 0.02 260)",
+      "card": "oklch(1 0 0)",
+      "card_foreground": "oklch(0.14 0.02 260)",
+      "popover": "oklch(1 0 0)",
+      "popover_foreground": "oklch(0.14 0.02 260)",
+      "primary": "oklch(0.55 0.22 245)",
+      "primary_foreground": "oklch(0.99 0 0)",
+      "secondary": "oklch(0.94 0.01 260)",
+      "secondary_foreground": "oklch(0.18 0.02 260)",
+      "muted": "oklch(0.94 0.01 260)",
+      "muted_foreground": "oklch(0.48 0.02 260)",
+      "accent": "oklch(0.92 0.02 250)",
+      "accent_foreground": "oklch(0.18 0.02 260)",
+      "destructive": "oklch(0.58 0.22 25)",
+      "border": "oklch(0.88 0.01 260)",
+      "input": "oklch(0.88 0.01 260)",
+      "ring": "oklch(0.55 0.22 245)"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "var(--font-sans), 'Outfit', system-ui, sans-serif",
+      "body": "var(--font-sans), 'Geist', 'Inter', system-ui, sans-serif",
+      "mono": "var(--font-mono), 'Geist Mono', 'JetBrains Mono', monospace"
+    },
+    "scale": {
+      "h1": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h2": "text-xl sm:text-2xl font-semibold tracking-tight",
+      "h3": "text-lg font-medium tracking-normal",
+      "body": "text-sm sm:text-base leading-relaxed",
+      "subtext": "text-xs sm:text-sm text-muted-foreground",
+      "badge": "text-xs font-mono font-medium tracking-wider uppercase"
+    }
+  },
+  "layout_strategy": {
+    "header": {
+      "style": "Sticky glassmorphic top bar with backdrop blur (backdrop-blur-xl bg-background/80 border-b border-border/60 z-40)",
+      "mobile": "Top-left 3-line Hamburger icon button (data-testid='mobile-menu-trigger'), centered brand logo + name ('Telegram Ultra'), and quick actions or status dot",
+      "desktop": "Brand logo + 'Telegram Ultra' title & subtitle on left, real-time agent status badge in center, and Sign Out button on right with confirmation modal"
+    },
+    "navigation": {
+      "desktop_tabs": "Horizontal glass segmented bar with rounded-xl padding, subtle hover transitions, active background indicator, badges, and Lucide icons (Users, UserPlus, Radio, Eye, Vote, Smile, UserCog, Trash2, MessageSquare)",
+      "mobile_sidebar": "Slide-in sheet from top-left (data-testid='mobile-nav-sheet') with Telegram Ultra header, status overview, nav items list with active state highlights, and full sign-out option at the bottom"
+    },
+    "sections": {
+      "userbots_accounts": "Grid layout with search/filter toolbar, add/import/buy CTA buttons, account status summary metrics, and responsive cards with live ping, phone, proxy, and action menus",
+      "data_heavy_tables": "Dense tactical tables with horizontal scrolling on mobile, explicit column widths, status badges, monospaced proxies/IDs, and accessible pagination/actions",
+      "form_panels": "Clean structured cards with clear field labels, helper text, inline validations, input group icons, and tactile primary buttons"
+    }
+  },
+  "component_guidelines": {
+    "buttons": "Pill-shaped or rounded-lg buttons with subtle scale on click (active:scale-[0.98]), clear hover states, explicit text color, and loading spinner states",
+    "cards": "Subtle border with inner glow, backdrop blur or solid carbon surface, rounded-xl radius, and p-4 to p-6 inner padding",
+    "badges": "Status badges with pulsing live indicators (green for Active/Online, red for Offline/Banned, amber for Processing/Pending)",
+    "dialogs": "Elevated modal dialogs with semi-transparent dark backdrop blur (bg-black/60 backdrop-blur-md) and clear header/footer actions",
+    "inputs": "Tactile dark input fields with border-border/80 focus:border-primary focus:ring-2 focus:ring-primary/30 text-sm font-mono for technical fields"
+  },
+  "testing_attributes": {
+    "rule": "ALL interactive and key informational elements MUST include a data-testid attribute in kebab-case format.",
+    "required_test_ids": [
+      "app-header",
+      "brand-title",
+      "mobile-menu-trigger",
+      "mobile-nav-sheet",
+      "nav-tab-accounts",
+      "nav-tab-channel-join",
+      "nav-tab-livestream",
+      "nav-tab-view",
+      "nav-tab-vote",
+      "nav-tab-reactions",
+      "nav-tab-profile",
+      "nav-tab-prp-delete",
+      "nav-tab-review",
+      "sign-out-button",
+      "db-status-banner",
+      "agent-status-bar",
+      "add-account-button",
+      "import-accounts-button",
+      "buy-account-button",
+      "account-card",
+      "account-status-badge",
+      "login-username-input",
+      "login-password-input",
+      "login-secret-input",
+      "login-submit-button"
+    ]
+  },
+  "general_ui_ux_guidelines": [
+    "Never center-align body text or dense form controls; keep left-aligned for natural reading order.",
+    "Do not use generic raw Inter or default unstyled components for headlines; use Outfit/Geist with tight tracking.",
+    "Ensure contrast ratios meet WCAG AA standards (minimum 4.5:1 for standard text).",
+    "Mobile layout MUST provide smooth touch targets (minimum 44x44px for buttons and hamburger triggers).",
+    "Active tab states must be clearly visual both in desktop tab bar and mobile slide-in menu.",
+    "Always rename product references from 'Telegram Pro' to 'Telegram Ultra' across all components, titles, aria-labels, and dialog text.",
+    "Micro-interactions: include smooth hover transforms, color shifts, and active press states for all interactive elements."
+  ]
+}

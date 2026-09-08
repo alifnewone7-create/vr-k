@@ -1,0 +1,50 @@
+# ============================================================================
+# iamhear userbot agent — systemd service (LS_Python source, run at /root/tgultra)
+#
+# Install:
+#   cp /root/tgultra/tgultra.service /etc/systemd/system/tgultra.service
+#   systemctl daemon-reload
+#   systemctl enable --now tgultra
+#
+# This runs the SUPERVISOR (multi-shard, self-healing). For a small setup you
+# can change agent.supervisor -> agent.worker in ExecStart below.
+# ============================================================================
+[Unit]
+Description=iamhear Telegram userbot agent (tgultra)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tgultra
+
+# Python that has the deps installed — the virtualenv at /root/tgultra/.venv.
+# Deps must be installed into this same venv:
+#   cd /root/tgultra && source .venv/bin/activate && pip install -r requirements.txt
+# For a small setup you can change agent.supervisor -> agent.worker below.
+ExecStart=/root/tgultra/.venv/bin/python -m agent.supervisor
+
+# Ensure root's user site-packages are visible under systemd too.
+Environment=HOME=/root
+
+# --- Auto-restart / 24-7 ---
+Restart=always
+RestartSec=3
+# Never give up restarting, even after repeated fast crashes.
+StartLimitIntervalSec=0
+
+# Logs go to the journal (view with: journalctl -u tgultra -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgultra
+
+# Unbuffered output so logs appear immediately.
+Environment=PYTHONUNBUFFERED=1
+
+# Give live-stream connections time to close cleanly on stop/restart.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

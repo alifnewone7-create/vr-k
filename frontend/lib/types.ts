@@ -1,0 +1,325 @@
+// Shared types mirroring the Neon schema. Keep these in sync with the SQL
+// tables and with the Python agent's expectations.
+
+// Lifecycle of a Telegram account inside the system:
+//  new            -> just added, nothing done yet
+//  purchased      -> bought via tg-lion, provision job queued (fully automatic)
+//  provisioning   -> agent is running the full tg-lion flow (api + login + 2FA)
+//  api_pending    -> create_app job queued, agent logging into my.telegram.org
+//  api_code       -> agent needs the my.telegram.org login code from you
+//  api_collected  -> api_id/api_hash captured and stored
+//  login_pending  -> userbot login code requested (sent to the phone)
+//  login_code     -> agent needs the Telegram login code from you
+//  login_2fa      -> account has 2FA, agent needs the password
+//  logged_in      -> session string stored, userbot ready
+//  failed         -> something went wrong (see last_error)
+//  frozen         -> Telegram froze/banned/deactivated the account (dead, no use).
+//                    Detected by the `check_frozen` job; see last_error for the
+//                    exact reason. These are excluded from all action pools.
+export type AccountStatus =
+  | "new"
+  | "purchased"
+  | "provisioning"
+  | "api_pending"
+  | "api_code"
+  | "api_collected"
+  | "login_pending"
+  | "login_code"
+  | "login_2fa"
+  | "logged_in"
+  | "failed"
+  | "frozen"
+
+export interface TelegramAccount {
+  id: number
+  label: string | null
+  phone_number: string
+  app_title: string
+  short_name: string
+  api_id: string | null
+  api_hash: string | null
+  session_string: string | null
+  status: AccountStatus
+  two_factor_required: boolean
+  last_error: string | null
+  // tg-lion provisioning metadata.
+  source: "manual" | "tglion"
+  country_code: string | null
+  two_step_password: string | null
+  // Live progress of the automatic tg-lion provisioning flow (buy -> api -> login).
+  // provision_step is a human-readable status line; provision_code is the actual
+  // Telegram login code the agent read from tg-lion. Both are null once done.
+  provision_step: string | null
+  provision_code: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type JobType =
+  | "provision_tglion" // full auto flow for a bought number: api + userbot login + 2FA
+  | "create_app" // log into my.telegram.org, create app, return api_id/api_hash
+  | "submit_mtproto_code" // pass the my.telegram.org login code to the agent
+  | "send_login_code" // request a userbot login code (sent to the phone)
+  | "submit_login_code" // pass the userbot login code (+ 2FA password) to the agent
+  | "join_livestream" // join the live stream / video chat of a chat
+  | "leave_livestream" // leave the live stream
+  | "join_channel" // join a channel/group so future view/react/vote actions work
+  | "view_post" // view a channel post from every logged-in userbot
+  | "detect_poll" // read the most recent poll in a channel and fill in vote_targets
+  | "cast_vote" // make one userbot vote on a poll option
+  | "retract_vote" // make one userbot remove its vote from a poll
+  | "update_profile" // change an account's name / username / profile photo
+  | "check_frozen" // probe accounts and mark frozen/banned/logged-out ones
+
+export type JobStatus = "queued" | "processing" | "done" | "failed"
+
+export interface Job {
+  id: number
+  type: JobType
+  account_id: number | null
+  payload: Record<string, any>
+  status: JobStatus
+  result: Record<string, any> | null
+  error: string | null
+  attempts: number
+  claimed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type LivestreamStatus = "idle" | "joining" | "active" | "leaving" | "stopped" | "failed"
+
+export interface LivestreamTarget {
+  id: number
+  chat_link: string
+  title: string | null
+  status: LivestreamStatus
+  joined_count: number
+  total_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface Agent {
+  id: string
+  hostname: string | null
+  last_seen: string
+  active_accounts: number
+  note: string | null
+}
+
+export interface PollOption {
+  index: number
+  text: string
+}
+
+export type VoteTargetStatus = "detecting" | "ready" | "failed"
+export type VoteCastStatus = "pending" | "voted" | "removing" | "failed"
+
+export interface VoteTarget {
+  id: number
+  poll_link: string
+  chat_id: number | null
+  message_id: number | null
+  poll_id: string | null
+  question: string | null
+  options: PollOption[]
+  multiple_choice: boolean
+  status: VoteTargetStatus
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// Per-option aggregate of how our userbots have voted, returned by the API.
+export interface VoteOptionTally {
+  index: number
+  text: string
+  pending: number
+  voted: number
+  failed: number
+  total: number // active casts (pending + voted) on this option
+}
+
+// A vote_targets row enriched with per-option tallies + availability counts.
+export interface VoteTargetRow extends VoteTarget {
+  tallies: VoteOptionTally[]
+  used_accounts: number // accounts with an active cast on this poll
+  available_accounts: number // logged-in userbots free to vote on this poll
+}
+
+export type ViewTargetStatus = "active" | "paused"
+
+export interface ViewTarget {
+  id: number
+  channel_link: string
+  chat_id: number | null
+  title: string | null
+  status: ViewTargetStatus
+  // Per-post view count range ("low to high"). When view_max > 0 a random number
+  // of userbots in [view_min, view_max] views each post so the count climbs
+  // gradually. When both are 0, every logged-in userbot views the post.
+  view_min: number
+  view_max: number
+  last_seen_message_id: number
+  posts_viewed: number
+  views_sent: number
+  last_post_at: string | null
+  last_checked_at: string | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// Pacing presets for auto-reactions. 'custom' uses custom_minutes as the exact
+// window in which all userbots finish reacting.
+export type ReactionMode = "slow" | "medium" | "fast" | "custom"
+export type ReactionTargetStatus = "active" | "paused"
+
+export interface ReactionTarget {
+  id: number
+  channel_link: string
+  chat_id: number | null
+  title: string | null
+  emojis: string[]
+  mode: ReactionMode
+  custom_minutes: number
+  // Per-post reaction count range ("below to high"). When react_max > 0 a random
+  // number of userbots in [react_min, react_max] reacts to each post. When both
+  // are 0, every logged-in userbot reacts.
+  react_min: number
+  react_max: number
+  status: ReactionTargetStatus
+  last_seen_message_id: number
+  posts_reacted: number
+  reactions_sent: number
+  last_post_at: string | null
+  last_checked_at: string | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// Lifecycle of a single profile edit request against one account.
+//  pending -> queued, agent hasn't run it yet
+//  done    -> profile changed successfully
+//  failed  -> something went wrong (see last_error), e.g. username taken
+export type ProfileUpdateStatus = "pending" | "done" | "failed"
+
+export interface ProfileUpdate {
+  id: number
+  account_id: number
+  first_name: string | null
+  last_name: string | null
+  username: string | null
+  photo_asset_id: number | null
+  status: ProfileUpdateStatus
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// An incoming Telegram message surfaced for an account. Only messages from
+// Telegram's official service account (777000, "Telegram") are captured — these
+// carry login codes and system notices. They live for 30 minutes then the agent
+// purges them, so the UI only ever shows a short rolling window.
+export interface AccountMessage {
+  id: number
+  sender: string
+  body: string
+  telegram_message_id: number | null
+  message_date: string | null
+  created_at: string
+}
+
+// Channel Join: get every userbot into a channel/group so later view/react/vote
+// actions work. A target is one "join this chat with N userbots" task.
+//  joining -> at least one bot still pending
+//  done    -> all bots joined / already members
+//  partial -> some joined, some failed
+//  failed  -> every bot failed
+export type ChannelJoinStatus = "joining" | "done" | "partial" | "failed"
+// Per-bot outcome. 'already_member' counts as success (bot is in the chat).
+export type ChannelJoinParticipantStatus = "pending" | "joining" | "joined" | "already_member" | "failed"
+
+export interface ChannelJoinTarget {
+  id: number
+  chat_link: string
+  title: string | null
+  status: ChannelJoinStatus
+  total_count: number
+  joined_count: number
+  failed_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ChannelJoinParticipant {
+  account_id: number
+  phone: string
+  label: string | null
+  status: ChannelJoinParticipantStatus
+  last_error: string | null
+}
+
+// A channel_join_targets row enriched with its per-bot participant rows.
+export interface ChannelJoinTargetRow extends ChannelJoinTarget {
+  participants: ChannelJoinParticipant[]
+}
+
+// Review / Direct-Message campaigns: userbots DM one target user text + media.
+export type MessageCampaignStatus = "sending" | "done" | "partial" | "failed"
+export type MessageSendStatus = "pending" | "sending" | "sent" | "failed"
+
+// One ordered step an account sends. `album` groups 1+ images (>1 = album);
+// `video` carries a single video asset.
+export type MessageStep =
+  | { kind: "text"; text: string }
+  | { kind: "album"; asset_ids: number[] }
+  | { kind: "video"; asset_ids: number[] }
+
+export interface MessageSendRow {
+  id: number
+  account_id: number
+  position: number
+  phone: string
+  label: string | null
+  steps: MessageStep[]
+  status: MessageSendStatus
+  last_error: string | null
+}
+
+export interface MessageCampaignRow {
+  id: number
+  target_link: string
+  target_title: string | null
+  status: MessageCampaignStatus
+  total_count: number
+  sent_count: number
+  failed_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+  sends: MessageSendRow[]
+}
+
+// A logged-in account shown as a numbered slot in the Review composer.
+export interface ReviewAccountSlot {
+  id: number
+  label: string | null
+  phone_number: string
+}
+
+// A telegram account row enriched with the latest profile-edit result, used by
+// the bulk profile editor UI.
+export interface ProfileAccountRow {
+  id: number
+  label: string | null
+  phone_number: string
+  status: AccountStatus
+  profile_status: ProfileUpdateStatus | null
+  profile_error: string | null
+  profile_updated_at: string | null
+}
