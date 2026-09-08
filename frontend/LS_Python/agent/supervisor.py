@@ -21,11 +21,11 @@ this supervisor only owns process lifecycle.
 
 USAGE
 -----
-    # spawns LS_WORKER_SHARDS processes (default 7)
+    # spawns LS_WORKER_SHARDS processes (default 10)
     python -m agent.supervisor
 
 Set the shard count in .env:
-    LS_WORKER_SHARDS=7
+    LS_WORKER_SHARDS=10
     LS_SOFT_MAX_PER_SHARD=70
 
 Single-process mode is still available with no supervisor:
@@ -44,10 +44,15 @@ import subprocess
 import sys
 import time
 
-# Number of worker processes to run. On an 8-core VPS, 7 leaves one core for the
-# OS + this supervisor + the DB driver. Each shard should stay under
+# Number of worker processes to run. Default 10 shards: the persistent WebRTC /
+# MTProto work is spread over more processes (each with its own event loop), so
+# a burst on one channel can't stall the others. Each shard should stay under
 # LS_SOFT_MAX_PER_SHARD bots; the worker logs a warning if it goes over.
-SHARD_COUNT = max(1, int(os.environ.get("LS_WORKER_SHARDS", "7")))
+#
+# NOTE on DB connections: every shard opens its own pool (AGENT_DB_POOL_MAX,
+# default 10), so 10 shards can reach ~100 connections. On a Postgres with
+# max_connections=100 set AGENT_DB_POOL_MAX=6 in .env (10 x 6 = 60).
+SHARD_COUNT = max(1, int(os.environ.get("LS_WORKER_SHARDS", "10")))
 
 # If a shard exits, wait this long before restarting it so a crash-loop can't
 # hammer Telegram / the DB. Restarts are logged so you can spot a bad shard.
@@ -147,7 +152,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
-    # Initial staggered launch: bringing 7 processes up at the exact same instant
+    # Initial staggered launch: bringing 10 processes up at the exact same instant
     # would create a synchronized burst of logins/joins. A tiny stagger smooths it.
     for s in shards:
         s.start()

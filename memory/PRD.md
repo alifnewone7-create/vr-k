@@ -23,5 +23,26 @@ Clone https://github.com/alifnewone7-create/a-v-k.git (public), copy all files/f
 - HMR websocket from the preview domain is blocked (allowedDevOrigins wildcard doesn't cover two-level subdomain `avk-preview.cluster-5.preview.emergentcf.cloud`). App works fine; only dev hot-reload affected. Left unchanged per "do not change anything".
 - P0 remaining: none. P1: none requested.
 
+## Agent speed + combined-engagement rework (2026-06, LS_Python)
+User report: "new task ashle ager gulo onek slow kore kaj kore" + wants multi-post/vote done in one channel visit, shard 7 -> 10, and everything visible in the VPS console. Reference repo for pacing logic: https://github.com/alifnewone7-create/auto-km.git (`frontend/LS_Python/agent`).
+
+RCA (why it was slow)
+1. `userbot.action_turn` had a FLEET-WIDE global lock (`AGENT_GLOBAL_ONE_BY_ONE=1`): only one userbot in the whole agent could act, then 4-5s of silence. 2 channels x 3 posts x 50 accounts = 300 turns in ONE line (~22 min); a new task queued behind all of it.
+2. `db.reserve_paced_slot` was ONE shared row (`agent_pacing` id=1): across all shards only 1 per-account job (vote/join/DM) could start per gap -> ~13 actions/min for the whole fleet, and every task competed in the same line.
+3. One job per post: the same account re-opened the channel for every post and paid the gap again each time.
+
+What changed
+- `userbot.py`: restored the repo's per-account STABLE delay window (`AGENT_ACCOUNT_DELAY_MIN/MAX`, default 3-20s, derived from account id). `action_turn(account_id, scope)` is now SCOPED (default scope = `chat:<id>`): one-by-one inside a channel/task, different channels/tasks in parallel. `AGENT_GLOBAL_ONE_BY_ONE=1` restores the old single line.
+- `userbot.engage_posts_scheduled(chat_id, message_ids, ..., vote=..., vote_sink=...)`: ONE visit per userbot = view + react for EVERY new post + its pending poll vote. `engage_post_scheduled` is now a single-post wrapper. Reaction preset (fast/medium/slow/custom) still spreads the visits when the window is wider than the natural gaps.
+- `worker.py`: `dispatch_views_for_target` / `dispatch_reactions_for_target` queue ONE `engage_post` job for the whole batch of posts (view-only, reaction-only and combined all go through it). `handle_engage_post` looks up `db.get_pending_vote_for_chat` and casts votes in the same visit; `handle_cast_vote` skips a cast that is already `voted`. New `job_pacing_scope(job)` gives every task its own paced line (`vote:<id>`, `join:<id>`, `live:<id>`, `dm:<id>`, `profile`). Dispatch gap back to repo default 3-5s.
+- `db.py`: `reserve_paced_slot(gap, scope)` now uses a new agent-owned table `agent_pacing_scopes` (idempotent, created at startup); added `get_pending_vote_for_chat`, `get_vote_cast_status`; `enqueue_engage_job` takes `message_ids` + nullable view/reaction target ids.
+- `supervisor.py` + docs: default `LS_WORKER_SHARDS=10` (docs recommend `AGENT_DB_POOL_MAX=6` -> 60 connections).
+- Console logging: `AGENT_VERBOSE=1` (default) prints every view/react/vote per account with the exact Telegram error on failure, plus per-post/visit summaries; `agent/__init__.py` line-buffers stdout/stderr; job completion lines now include the counts.
+
+Verification (no Telegram/Neon needed)
+- `python -m tests.test_engage_flow` (39 checks, fake pyrogram) — pacing profile, shard split, membership pool, channel cache, one-visit engage, multi-post single visit, vote in same visit, same-channel gap kept, different channels run in parallel.
+- `DATABASE_URL=... python -m tests.test_db_pacing` (21 checks, real Postgres) — scoped pacing gate, membership map, engage job payload, pending-vote lookup.
+- `DATABASE_URL=... python -m tests.test_engage_job` (real Postgres + fake Telegram) — full job flow incl. counters, vote_casts, cast_vote skip, reaction-only mode.
+
 ## Next action items
 - User to sign in with their username/password/secret to use the dashboard.

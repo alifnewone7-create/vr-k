@@ -72,17 +72,18 @@ python -m agent.supervisor
 Set the shard count in `.env` (defaults shown):
 
 ```env
-LS_WORKER_SHARDS=7          # on an 8-core VPS, 7 leaves a core for the OS
+LS_WORKER_SHARDS=10         # default: 10 processes
 LS_SOFT_MAX_PER_SHARD=70    # warn-only hint if a shard gets too many bots
+AGENT_DB_POOL_MAX=6         # 10 shards x 6 = 60 DB connections
 ```
 
 You should see:
 
 ```
-[supervisor] launching 7 worker shard(s)...
-[supervisor] started shard 1/7 (pid 12345)
-[i] Iamhear agent 'agent-main-s0' starting on YOUR-VPS (shard 1/7)
-[i] Shard 1/7: handling accounts where id % 7 == 0 (soft max 70)
+[supervisor] launching 10 worker shard(s)...
+[supervisor] started shard 1/10 (pid 12345)
+[i] Iamhear agent 'agent-main-s0' starting on YOUR-VPS (shard 1/10)
+[i] Shard 1/10: handling accounts where id % 10 == 0 (soft max 70)
 ...
 ```
 
@@ -150,3 +151,42 @@ login_pending → login_code → (login_2fa) → logged_in` (or `failed`).
   (one per account). You can extend `agent/userbot.py` to pass a proxy to `Client`.
 - Running many active calls is **resource heavy** (RAM/CPU/bandwidth) — size your
   VPS accordingly.
+
+
+---
+
+### How the pacing works (views / reactions / votes)
+
+Two things run at the same time, on purpose:
+
+1. **Per-account gap.** Every account has its OWN stable delay window inside
+   `AGENT_ACCOUNT_DELAY_MIN`..`AGENT_ACCOUNT_DELAY_MAX` (default **3-20s**),
+   derived from its id — account #101 might always rest 4-9s while #102 rests
+   8-20s. So the fleet never ticks like one script on a timer, and an account
+   never fires two actions back-to-back.
+
+2. **One-by-one per TASK, parallel across tasks.** Inside one channel (or one
+   poll, one channel-join task, one DM campaign) the accounts act strictly one
+   after another with that gap. A DIFFERENT task has its own line and runs at the
+   same time — adding a new task never makes the older ones crawl.
+   `AGENT_ACTION_DISPATCH_GAP_MIN/MAX` (default 3-5s) is the start gap inside a
+   task, shared across all shards through `agent_pacing_scopes`.
+   Set `AGENT_GLOBAL_ONE_BY_ONE=1` if you ever want the old single fleet-wide
+   line back (much slower).
+
+**One visit per userbot.** When several posts land together, ONE `engage_post`
+job is queued for the whole batch: each userbot opens the channel once and views
++ reacts to every new post, and also casts its pending poll vote for that
+channel in the same visit. It never pays the gap twice for the same channel.
+
+**Console output.** `AGENT_VERBOSE=1` (default) prints every single action:
+
+```
+[engage] chat -1001234567890: 3 post(s) [901, 902, 903] + 12 vote(s) with 48 userbot(s)
+[view]  chat -1001234567890 msg #901 acct 137 -> OK
+[react] chat -1001234567890 msg #901 acct 137 -> OK 🔥
+[vote]  chat -1001234567890 poll #800 acct 137 -> OK option 2
+[engage] chat -1001234567890: done in 214s — 141 view(s), 44 reaction(s), 12 vote(s) from 48 userbot(s)
+```
+
+Set `AGENT_VERBOSE=0` to keep only the summaries and the errors.

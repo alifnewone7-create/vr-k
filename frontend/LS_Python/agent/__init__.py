@@ -28,6 +28,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Line-buffer the console so every `[view] / [react] / [vote]` line shows up on
+# the VPS immediately (journalctl / screen / a plain terminal), instead of
+# sitting in a pipe buffer until the process writes 8 KB.
+import sys as _sys
+
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 _LS_ROOT = Path(__file__).resolve().parent.parent
 
 # 2) Main config. `override=False` keeps the real environment on top.

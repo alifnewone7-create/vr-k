@@ -15,7 +15,7 @@ hote HOBE.
 |---|---|
 | OS | Ubuntu 22.04 / 24.04 ba Debian 12 |
 | Python | **3.11 ba 3.12** (3.13/3.14 e `py-tgcalls` stable noy) |
-| CPU | 500-1000 bot-er jonno 8 core bhalo (`LS_WORKER_SHARDS=7`) |
+| CPU | 500-1000 bot-er jonno 8 core bhalo (`LS_WORKER_SHARDS=10`) |
 | RAM | 4 GB+ |
 | DB | Panel jei `DATABASE_URL` use korche, hubohu shei ta |
 
@@ -94,13 +94,18 @@ TGLION_USER_ID=<apnar tg-lion user id>
 TGLION_BASE_URL=https://tg-lion.net
 TGLION_NEW_2FA_PASSWORD=<sob kena account-e jei 2FA password boshbe>
 
-# Sharding — 8 core VPS-e 7 bhalo
-LS_WORKER_SHARDS=7
+# Sharding — default 10 shard (beshi process = ek channel-er kaj onno
+# channel-ke ar slow kore na)
+LS_WORKER_SHARDS=10
 LS_SOFT_MAX_PER_SHARD=70
 
-# DB pool
+# DB pool — 10 shard x 6 = 60 connection (max_connections=100 hole nirapod)
 AGENT_DB_POOL_MIN=2
-AGENT_DB_POOL_MAX=10
+AGENT_DB_POOL_MAX=6
+
+# Console log — protita view/react/vote line-by-line dekhabe (0 dile sudhu
+# summary + error)
+AGENT_VERBOSE=1
 ```
 
 `.env.vps.example` file-e **protita option-er byakkha** ache (pacing, join
@@ -133,8 +138,9 @@ chmod 600 /root/tgultra/.env
 ```
 
 > **`max_connections` hishab:** `LS_WORKER_SHARDS` x `AGENT_DB_POOL_MAX` =
-> 7 x 10 = **70** connection. Neon free tier-e ba chhoto Postgres-e eta beshi
-> hole `LS_WORKER_SHARDS` ba `AGENT_DB_POOL_MAX` kamiye nin.
+> 10 x 6 = **60** connection. Postgres-e `max_connections` 100 hole eta nirapod.
+> `AGENT_DB_POOL_MAX=10` rakhle 10 x 10 = 100 hoye jabe — tokhon
+> `max_connections` baran ba pool kamiye nin.
 
 ---
 
@@ -190,7 +196,7 @@ cd /root/tgultra
 .venv/bin/python -m agent.supervisor
 ```
 
-Log-e shard gula chalu hote dekhben. Panel-er upore **"7 agents online"** (ba
+Log-e shard gula chalu hote dekhben. Panel-er upore **"10 agents online"** (ba
 apnar shard shonkha) dekhale sob thik.
 
 `Ctrl+C` diye bondho korun — ekhon systemd-te bosabo.
