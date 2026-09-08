@@ -83,3 +83,9 @@ android-sdk/.pnpm-store/v3/files/38/8f0ba1f39d9a142936801bf2b2957d7d7cd43af0022f
 frontend/node_modules/.pnpm/@next+swc-linux-arm64-gnu@16.2.6/node_modules/@next/swc-linux-arm64-gnu/next-swc.linux-arm64-gnu.node
 .pnpm-store/v3/files/38/8f0ba1f39d9a142936801bf2b2957d7d7cd43af0022f06ba6c2e3425dba9402948f6d54e99e0c0b14a20e399642e81d2bf2c90ea66908548f2b771b94e8fa7
 frontend/.next/dev/cache/turbopack/ee6e79b1/00000041.sst
+.env
+.env.*
+*.env
+credentials.json
+*.key
+.credentials
