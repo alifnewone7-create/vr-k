@@ -89,7 +89,7 @@ raise_fd_limit()
 # check_frozen is fanned out too: a global health scan must reach EVERY shard's
 # bots, not just the one shard that happens to claim the job (which would only
 # probe ~1/N of the fleet and report the rest as untouched).
-FANOUT_JOB_TYPES = ("view_post", "react_post", "engage_post", "leave_livestream_all", "check_frozen")
+FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen")
 
 # Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
 # a bounded number of server connections; the agent reuses these warm connections
@@ -694,54 +694,35 @@ def clear_account_cooldown(account_id: int) -> None:
     )
 
 
-_PACING_SCOPES_READY = False
-
-
-def ensure_pacing_scopes_table() -> None:
-    """Create the per-scope pacing gate table on first use (idempotent)."""
-    global _PACING_SCOPES_READY
-    if _PACING_SCOPES_READY:
-        return
-    query(
-        """
-        CREATE TABLE IF NOT EXISTS agent_pacing_scopes (
-          scope         TEXT PRIMARY KEY,
-          next_start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    _PACING_SCOPES_READY = True
-
-
-def reserve_paced_slot(gap_seconds: float, scope: str = "global") -> float:
+def reserve_paced_slot(gap_seconds: float) -> float:
     """
-    Reserve the next action-start slot for ONE scope, shared across every shard.
+    Reserve the next GLOBAL action-start slot, shared across every shard.
 
-    A scope is one task: a channel-join task, a poll, a livestream, a DM
-    campaign... Inside a scope the accounts start strictly one-by-one,
-    `gap_seconds` apart, no matter how many shards run (the row is upserted
-    atomically, so two shards can never grab the same slot). DIFFERENT scopes
-    have their own independent line, which is what stops a newly added task from
-    making every older task crawl behind it.
+    All worker shards call this before starting a per-account action. It bumps a
+    single shared timestamp (agent_pacing.next_start_at) forward by `gap_seconds`
+    in ONE atomic statement and returns how many seconds THIS caller must wait
+    before it may start. Because the row is locked for the update, two shards can
+    never grab the same slot — so across the whole fleet the accounts start
+    strictly one-by-one, `gap_seconds` apart, no matter how many shards run.
 
-    Returns the wait in seconds (0 if that scope's gate was idle).
+    Returns the wait in seconds (0 if the gate was idle / in the past).
     """
     gap = max(0.0, float(gap_seconds))
-    ensure_pacing_scopes_table()
     rows = query(
         """
-        INSERT INTO agent_pacing_scopes (scope, next_start_at)
-        VALUES (%s, now() + (%s || ' seconds')::interval)
-        ON CONFLICT (scope) DO UPDATE
-        SET next_start_at = GREATEST(agent_pacing_scopes.next_start_at, now())
-                            + (%s || ' seconds')::interval,
-            updated_at = now()
-        RETURNING EXTRACT(
-            EPOCH FROM (next_start_at - (%s || ' seconds')::interval - now())
-        ) AS wait_seconds
+        WITH cur AS (
+            SELECT GREATEST(next_start_at, now()) AS slot
+            FROM agent_pacing
+            WHERE id = 1
+            FOR UPDATE
+        )
+        UPDATE agent_pacing p
+        SET next_start_at = cur.slot + (%s || ' seconds')::interval
+        FROM cur
+        WHERE p.id = 1
+        RETURNING EXTRACT(EPOCH FROM (cur.slot - now())) AS wait_seconds
         """,
-        (scope, gap, gap, gap),
+        (gap,),
     )
     if not rows:
         return 0.0
@@ -1235,100 +1216,6 @@ def enqueue_reaction_job(
             ),
         ),
     )
-
-
-def enqueue_engage_job(
-    chat_id: int,
-    message_ids: list[int],
-    view_target_id: int | None,
-    view_min: int,
-    view_max: int,
-    reaction_target_id: int | None,
-    emojis: list[str],
-    mode: str,
-    custom_minutes: int,
-    react_min: int = 0,
-    react_max: int = 0,
-) -> None:
-    """
-    Queue ONE combined job for ALL the new posts of a channel.
-
-    Instead of a separate view_post / react_post job per post (which made the
-    same account open the same channel again and again, burning a pacing gap
-    every time), the agent gives each account a SINGLE visit in which it views
-    and reacts to every new post — and casts its pending poll vote for that
-    channel too. `view_target_id`/`reaction_target_id` may be None when only one
-    of the two features is active on the channel.
-    """
-    ids = sorted({int(m) for m in (message_ids or [])})
-    if not ids:
-        return
-    query(
-        "INSERT INTO jobs (type, account_id, payload, status) "
-        "VALUES ('engage_post', NULL, %s::jsonb, 'queued')",
-        (
-            json.dumps(
-                {
-                    "chat_id": chat_id,
-                    "message_ids": ids,
-                    "message_id": ids[-1],  # legacy readers / logs
-                    "view_target_id": view_target_id,
-                    "view_min": view_min,
-                    "view_max": view_max,
-                    "reaction_target_id": reaction_target_id,
-                    "emojis": emojis,
-                    "mode": mode,
-                    "custom_minutes": custom_minutes,
-                    "react_min": react_min,
-                    "react_max": react_max,
-                }
-            ),
-        ),
-    )
-
-
-def get_pending_vote_for_chat(chat_id: int) -> dict | None:
-    """
-    The poll vote work still pending for THIS channel, so a userbot that is
-    already visiting the channel (views/reactions) can cast its vote in the very
-    same visit instead of queueing behind a separate job.
-
-    Returns {"target_id", "message_id", "poll_link", "assignments": {acc: opt}}
-    or None when nothing is pending.
-    """
-    if not chat_id:
-        return None
-    rows = query(
-        """
-        SELECT t.id AS target_id, t.message_id, t.poll_link,
-               c.account_id, c.option_index
-        FROM vote_targets t
-        JOIN vote_casts c ON c.target_id = t.id AND c.status = 'pending'
-        JOIN telegram_accounts a ON a.id = c.account_id AND a.status = 'logged_in'
-        WHERE t.chat_id = %s AND t.status = 'ready' AND t.message_id IS NOT NULL
-        ORDER BY t.id DESC, c.account_id
-        """,
-        (int(chat_id),),
-    )
-    if not rows:
-        return None
-    target_id = rows[0]["target_id"]
-    picked = [r for r in rows if r["target_id"] == target_id]
-    return {
-        "target_id": int(target_id),
-        "message_id": int(picked[0]["message_id"]),
-        "poll_link": picked[0].get("poll_link"),
-        "assignments": {int(r["account_id"]): int(r["option_index"]) for r in picked},
-    }
-
-
-def get_vote_cast_status(target_id: int, account_id: int) -> str | None:
-    """This account's current status on that poll ('pending'/'voted'/...)."""
-    rows = query(
-        "SELECT status FROM vote_casts WHERE target_id = %s AND account_id = %s",
-        (int(target_id), int(account_id)),
-    )
-    return rows[0]["status"] if rows else None
 
 
 # ---------------------------------------------------------------------------

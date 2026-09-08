@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from contextlib import asynccontextmanager
 from typing import Optional
 
 from pyrogram import Client, filters
@@ -263,8 +262,7 @@ def _get_action_sem() -> asyncio.Semaphore:
 # account viewed / reacted with which emoji / voted which option, and the exact
 # Telegram error when it fails). Detail is ON by default so `journalctl -u
 # tgultra -f` shows the whole picture; set AGENT_VERBOSE=0 to keep only the
-# per-post summaries and errors. Everything is flushed immediately so nothing
-# sits in a pipe buffer.
+# per-post summaries and the errors.
 VERBOSE = _os.environ.get("AGENT_VERBOSE", "1").lower() not in ("0", "false", "no")
 
 
@@ -294,7 +292,7 @@ def vlog(msg: str) -> None:
 #     flooded account new jobs. See db.set_account_cooldown / claim_next_jobs.
 # ---------------------------------------------------------------------------
 
-# The min/max seconds an account rests between its OWN requests. Every account
+# The min/max seconds an account rests between its own requests. Each account
 # gets a STABLE personal range inside these bounds (derived from its id), so
 # account #101 might always pace 4-9s while #102 paces 8-20s — 250 accounts stop
 # looking like one script running on a timer. Tunable via env.
@@ -311,9 +309,9 @@ _ACCOUNT_LOCKS: dict[int, asyncio.Lock] = {}
 def _account_delay_profile(account_id: int) -> tuple[float, float]:
     """
     A STABLE (lo, hi) pacing window for one account, derived deterministically
-    from its id — the same account always gets the same personality, but
-    different accounts differ. This is what breaks the "all 250 behave
-    identically" fingerprint that gets fleets flagged.
+    from its id — same account always gets the same personality, but different
+    accounts differ. This is what breaks the "all 250 behave identically"
+    fingerprint that gets fleets flagged.
     """
     rng = random.Random(account_id * 2654435761 & 0xFFFFFFFF)
     span = max(0.0, ACCOUNT_DELAY_MAX - ACCOUNT_DELAY_MIN)
@@ -359,61 +357,6 @@ def account_in_pacing_cooldown(account_id: int) -> bool:
     return _ACCOUNT_NEXT_FREE.get(account_id, 0.0) > time.monotonic()
 
 
-# ---------------------------------------------------------------------------
-# Turn gate: one userbot at a time INSIDE A SCOPE (not fleet-wide)
-# ---------------------------------------------------------------------------
-# A scope is normally one channel ("chat:-100123...") or one vote target. Inside
-# a scope the userbots take turns strictly one-by-one: an account acts, then its
-# own personal gap must pass before the NEXT account starts. Different scopes
-# (another channel, a vote, a livestream) run in PARALLEL, each with its own
-# one-by-one line — so a newly added task never queues behind everything else.
-#
-# The old behaviour was a single fleet-wide line, which meant 2 channels x 3
-# posts x 50 accounts all waited in ONE queue and the older tasks crawled. Set
-# AGENT_GLOBAL_ONE_BY_ONE=1 to bring that single shared line back.
-GLOBAL_ONE_BY_ONE = _os.environ.get("AGENT_GLOBAL_ONE_BY_ONE", "0").lower() not in ("0", "false", "no")
-
-_SCOPE_LOCKS: dict[str, asyncio.Lock] = {}
-_SCOPE_NEXT_FREE: dict[str, float] = {}
-
-
-def _scope_key(account_id: int, scope: Optional[str]) -> str:
-    if GLOBAL_ONE_BY_ONE:
-        return "global"
-    return str(scope) if scope else f"acct:{account_id}"
-
-
-def _scope_lock(key: str) -> asyncio.Lock:
-    lock = _SCOPE_LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _SCOPE_LOCKS[key] = lock
-    return lock
-
-
-@asynccontextmanager
-async def action_turn(account_id: int, scope: Optional[str] = None):
-    """
-    One userbot's turn inside `scope`. Waits out the previous turn's gap, holds
-    the turn for the whole body (so a view + reaction + vote on the same visit
-    count as ONE turn), then arms this account's personal gap for the next
-    userbot of the SAME scope. Other scopes are unaffected.
-    """
-    key = _scope_key(account_id, scope)
-    async with _scope_lock(key):
-        now = time.monotonic()
-        ready_at = _SCOPE_NEXT_FREE.get(key, 0.0)
-        if ready_at > now:
-            await asyncio.sleep(ready_at - now)
-        async with _get_account_lock(account_id):
-            await account_gate(account_id)
-            try:
-                yield
-            finally:
-                note_account_paced(account_id)
-                _SCOPE_NEXT_FREE[key] = time.monotonic() + _account_pacing_delay(account_id)
-
-
 # When ON (default), the bulk fan-out actions (views, reactions) run STRICTLY
 # one account at a time: an account acts, then we wait ITS personal delay before
 # the NEXT account even starts. This is the "one by one with a gap, not all at
@@ -423,7 +366,7 @@ async def action_turn(account_id: int, scope: Optional[str] = None):
 SEQUENTIAL_ACTIONS = _os.environ.get("AGENT_SEQUENTIAL_ACTIONS", "1").lower() not in ("0", "false", "no")
 
 
-async def run_pool_actions(pool, action, offsets=None, scope: Optional[str] = None) -> list:
+async def run_pool_actions(pool, action, offsets=None) -> list:
     """
     Run `action(account_id, client)` for every (account_id, client) in `pool`.
 
@@ -441,14 +384,13 @@ async def run_pool_actions(pool, action, offsets=None, scope: Optional[str] = No
     results: list = []
     if SEQUENTIAL_ACTIONS:
         for acc_id, client in pool:
-            # One turn per account inside THIS scope: the gate waits out the
-            # previous userbot's personal gap, so the accounts of one channel act
-            # one-by-one — while other channels/tasks run in parallel.
-            async with action_turn(acc_id, scope):
-                try:
-                    results.append(await action(acc_id, client))
-                except Exception as e:  # noqa: BLE001 - isolate per-account failures
-                    results.append(e)
+            try:
+                results.append(await action(acc_id, client))
+            except Exception as e:  # noqa: BLE001 - isolate per-account failures
+                results.append(e)
+            # The gap BEFORE the next account starts = this account's personal
+            # delay window. This is what the user sees as "3s+ between each".
+            await asyncio.sleep(_account_pacing_delay(acc_id))
         return results
 
     # Legacy concurrent fan-out (staggered starts, then all overlap).
@@ -2209,59 +2151,6 @@ def _member_pool(member_ids: Optional[list[int]] = None) -> list[tuple[int, Clie
     return [(a, e["client"]) for a, e in _POOL.items()]
 
 
-def _shard_share(
-    lo: int,
-    hi: int,
-    seed_key: str,
-    shard_index: int,
-    shard_count: int,
-    pool_size: int,
-) -> Optional[int]:
-    """
-    How many accounts THIS shard should use for a "low to high" amount.
-
-    Returns None when the whole pool should act (hi == 0). The global total is
-    rolled once from a per-post seed so every shard agrees on the same number
-    without talking to each other, then split evenly across shards.
-    """
-    lo = max(0, int(lo or 0))
-    hi = max(0, int(hi or 0))
-    if hi <= 0:
-        return None
-    if lo > hi:
-        lo, hi = hi, lo
-    shards = max(1, int(shard_count or 1))
-    idx = min(max(0, int(shard_index or 0)), shards - 1)
-    total = random.Random(seed_key).randint(lo, hi)
-    if total <= 0:
-        return 0
-    base, remainder = divmod(total, shards)
-    mine = base + (1 if idx < remainder else 0)
-    return max(0, min(mine, pool_size))
-
-
-async def _view_once(
-    client: Client, chat_id: int, message_id: int, account_id: Optional[int] = None
-) -> tuple[bool, bool]:
-    """
-    Register ONE view. Returns (ok, not_a_member). Never raises: a per-account
-    failure must not abort the batch.
-    """
-    who = f"acct {account_id}" if account_id else "acct ?"
-    try:
-        peer = await client.resolve_peer(chat_id)
-        await client.invoke(GetMessagesViews(peer=peer, id=[int(message_id)], increment=True))
-        vlog(f"[view] chat {chat_id} msg #{message_id} {who} -> OK")
-        return True, False
-    except Exception as e:  # noqa: BLE001
-        not_member = _is_not_member_error(e)
-        log(
-            f"[view] chat {chat_id} msg #{message_id} {who} -> FAIL "
-            f"({'not a member' if not_member else e.__class__.__name__}: {e})"
-        )
-        return False, not_member
-
-
 async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0.0) -> int:
     """
     Increment the view count of a post from EVERY warm userbot, but trickle the
@@ -2307,30 +2196,55 @@ async def view_post_scheduled(
     member_ids: Optional[list[int]] = None,
 ) -> int:
     """
-    View a single post from the userbots that are inside this channel, trickling
-    the views in one account at a time (each waits its 4s gap before the next
-    starts) so the count climbs like real viewers instead of a single spike.
+    View a single post from the warm userbots, trickling the views in over
+    `spread_seconds` (front-loaded, uneven gaps) so a post's view count climbs
+    like real viewers arriving one after another instead of a single instant
+    spike.
 
     "Low to high" amount: when view_max > 0, only a RANDOM number of userbots in
-    [view_min, view_max] views the post. When view_max is 0, every member views.
+    [view_min, view_max] views the post (a fresh random subset each time, capped
+    at the pool size). When view_max is 0, every warm userbot views.
 
-    `member_ids` restricts the pool to the accounts stored for this channel; a
-    successful view also teaches the membership map, and an account Telegram says
-    cannot see the channel is dropped from it.
+    Sharding: this handler runs once PER shard (each shard owns a slice of the
+    userbots). The [view_min, view_max] range is a GLOBAL target for the whole
+    post, so we must NOT re-roll it independently on every shard - otherwise a
+    channel split across N shards would get up to N x the requested views (i.e.
+    effectively every userbot views). Instead we roll the total ONCE using a
+    per-post deterministic seed (so every shard agrees on the same number) and
+    then hand this shard only its fair slice of that total.
 
-    Sharding: the [view_min, view_max] range is a GLOBAL target for the post, so
-    the total is rolled once from a per-post seed and split across shards (see
-    _shard_share) instead of being re-rolled per shard.
+    Returns how many userbots successfully registered a view.
     """
+    # Only the userbots known to be inside this channel act on it (the whole warm
+    # pool when the membership map is still empty, which then fills itself in).
     pool = _member_pool(member_ids)
     if not pool:
         return 0
 
-    my_count = _shard_share(
-        view_min, view_max, f"view:{chat_id}:{message_id}:{view_min}:{view_max}",
-        shard_index, shard_count, len(pool),
-    )
-    if my_count is not None:
+    # Pick a "low to high" amount of userbots for this specific post.
+    lo = max(0, int(view_min or 0))
+    hi = max(0, int(view_max or 0))
+    if hi > 0:
+        if lo > hi:
+            lo, hi = hi, lo
+        shards = max(1, int(shard_count or 1))
+        idx = min(max(0, int(shard_index or 0)), shards - 1)
+
+        # Roll the GLOBAL total once, identically on every shard, seeded by the
+        # post so all shards compute the same number without talking to each other.
+        rng = random.Random(f"view:{chat_id}:{message_id}:{lo}:{hi}")
+        total_count = rng.randint(lo, hi)
+        if total_count <= 0:
+            return 0
+
+        # Split the global total evenly across shards; the first `remainder`
+        # shards take one extra so the per-shard shares sum EXACTLY to total_count.
+        base, remainder = divmod(total_count, shards)
+        my_count = base + (1 if idx < remainder else 0)
+
+        # Cap at this shard's local pool (shares are only ever short, never over,
+        # which keeps the global total <= the requested "high").
+        my_count = min(my_count, len(pool))
         if my_count <= 0:
             return 0
         pool = random.sample(pool, my_count)
@@ -2344,19 +2258,29 @@ async def view_post_scheduled(
         # Gate the actual MTProto work so a big pool can't flood the event loop
         # and starve the WebRTC keepalives of bots that are in a live stream.
         async with sem:
-            ok, not_member = await _view_once(client, chat_id, message_id, acc_id)
-        if ok:
-            ok_ids.append(acc_id)
-        elif not_member:
-            bad_ids.append(acc_id)
-        return ok
+            try:
+                peer = await client.resolve_peer(chat_id)
+                await client.invoke(
+                    GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
+                )
+                vlog(f"[view] chat {chat_id} msg #{message_id} acct {acc_id} -> OK")
+                ok_ids.append(acc_id)
+                return True
+            except Exception as e:
+                not_member = _is_not_member_error(e)
+                if not_member:
+                    bad_ids.append(acc_id)
+                log(
+                    f"[view] chat {chat_id} msg #{message_id} acct {acc_id} -> FAIL "
+                    f"({'not a member' if not_member else e.__class__.__name__}: {e})"
+                )
+                return False
 
-    # Drips one account at a time (default), each waiting its own personal gap
-    # before the next. The scope is this CHANNEL, so another channel's views run
-    # in parallel instead of queueing behind these.
+    # Drips one account at a time (default), each waiting its personal delay
+    # before the next — the per-account gap the fleet uses to avoid bursts.
     started = time.monotonic()
     log(f"[view] chat {chat_id} msg #{message_id}: starting with {len(pool)} userbot(s)")
-    results = await run_pool_actions(pool, _one, offsets, scope=f"chat:{chat_id}")
+    results = await run_pool_actions(pool, _one, offsets)
     await _note_membership(chat_id, ok_ids, bad_ids)
     done = sum(1 for ok in results if ok is True)
     log(
@@ -2698,28 +2622,11 @@ async def _react_once(
                 f"{last_kind.upper()} ({e.__class__.__name__}: {e})"
             )
             continue
-    log(f"[react] chat {chat_id} msg #{message_id} {who} -> FAIL ({last_kind}, tried {len(emojis)} emoji)")
+    log(
+        f"[react] chat {chat_id} msg #{message_id} {who} -> FAIL "
+        f"({last_kind}, tried {len(emojis)} emoji)"
+    )
     return last_kind
-
-
-async def _vote_once(
-    client: Client, chat_id: int, message_id: int, option_index: int, account_id: Optional[int] = None
-) -> tuple[bool, str]:
-    """
-    Cast ONE poll vote. Returns (ok, error_text). Never raises so a single bad
-    account can't abort the visit.
-    """
-    who = f"acct {account_id}" if account_id else "acct ?"
-    try:
-        await client.vote_poll(chat_id, int(message_id), int(option_index))
-        vlog(f"[vote] chat {chat_id} poll #{message_id} {who} -> OK option {option_index}")
-        return True, ""
-    except Exception as e:  # noqa: BLE001
-        log(
-            f"[vote] chat {chat_id} poll #{message_id} {who} option {option_index} -> "
-            f"FAIL ({e.__class__.__name__}: {e})"
-        )
-        return False, f"{e.__class__.__name__}: {e}"
 
 
 async def react_post_scheduled(
@@ -2734,18 +2641,22 @@ async def react_post_scheduled(
     member_ids: Optional[list[int]] = None,
 ) -> int:
     """
-    React to a single post from the userbots that are inside this channel, one
-    account at a time (each waits its 4s gap before the next), spread inside
-    [0, window_seconds] so the reactions don't all land together.
+    React to a single post from the warm userbots, staggering each userbot's
+    reaction at a random offset inside [0, window_seconds] so the reactions don't
+    all land at once. All reactions are guaranteed to complete within the window.
 
     "Below to high" amount: when react_max > 0, only a RANDOM number of userbots
-    in [react_min, react_max] reacts. 0 means every member reacts.
+    in [react_min, react_max] reacts to this post (a fresh random subset each
+    time, capped at the pool size). When react_max is 0, every warm userbot
+    reacts.
 
-    `member_ids` restricts the pool to the accounts stored for this channel, and
-    a successful reaction teaches the membership map.
-
-    Sharding: the range is a GLOBAL target for the post, so the total is rolled
-    once from a per-post seed and split across shards (see _shard_share).
+    Sharding: this handler runs once PER shard (each shard owns a slice of the
+    userbots). The [react_min, react_max] range is a GLOBAL target for the whole
+    post, so we must NOT re-roll it independently on every shard - otherwise a
+    channel split across N shards would get up to N x the requested reactions
+    (i.e. effectively every userbot reacts). Instead we roll the total ONCE using
+    a per-post deterministic seed (so every shard agrees on the same number) and
+    then hand this shard only its fair slice of that total.
 
     Returns how many userbots successfully reacted (emojis the channel rejects
     are skipped, so the count can be lower than the number chosen).
@@ -2754,11 +2665,30 @@ async def react_post_scheduled(
     if not pool or not emojis:
         return 0
 
-    my_count = _shard_share(
-        react_min, react_max, f"{chat_id}:{message_id}:{react_min}:{react_max}",
-        shard_index, shard_count, len(pool),
-    )
-    if my_count is not None:
+    # Pick a "below to high" amount of userbots for this specific post.
+    lo = max(0, int(react_min or 0))
+    hi = max(0, int(react_max or 0))
+    if hi > 0:
+        if lo > hi:
+            lo, hi = hi, lo
+        shards = max(1, int(shard_count or 1))
+        idx = min(max(0, int(shard_index or 0)), shards - 1)
+
+        # Roll the GLOBAL total once, identically on every shard, seeded by the
+        # post so all shards compute the same number without talking to each other.
+        rng = random.Random(f"{chat_id}:{message_id}:{lo}:{hi}")
+        total_count = rng.randint(lo, hi)
+        if total_count <= 0:
+            return 0
+
+        # Split the global total evenly across shards; the first `remainder`
+        # shards take one extra so the per-shard shares sum EXACTLY to total_count.
+        base, remainder = divmod(total_count, shards)
+        my_count = base + (1 if idx < remainder else 0)
+
+        # Cap at this shard's local pool (shares are only ever short, never over,
+        # which keeps the global total <= the requested "high").
+        my_count = min(my_count, len(pool))
         if my_count <= 0:
             return 0
         pool = random.sample(pool, my_count)
@@ -2786,10 +2716,13 @@ async def react_post_scheduled(
         return kind
 
     started = time.monotonic()
-    log(f"[react] chat {chat_id} msg #{message_id}: starting with {len(pool)} userbot(s), emojis {emojis}")
+    log(
+        f"[react] chat {chat_id} msg #{message_id}: starting with {len(pool)} userbot(s), "
+        f"emojis {emojis}"
+    )
     # Probes run one-by-one too (with their own gap) so even the test phase never
     # fires two accounts at the same instant.
-    probe_results = await run_pool_actions(probe_pool, _gated_react, scope=f"chat:{chat_id}")
+    probe_results = await run_pool_actions(probe_pool, _gated_react)
     success = sum(1 for r in probe_results if r == "ok")
     blocked = sum(1 for r in probe_results if r == "blocked")
 
@@ -2815,7 +2748,7 @@ async def react_post_scheduled(
     # Drip the reactions one account at a time (default): each account reacts,
     # then waits its own personal delay before the next account reacts. One bad
     # account is captured in-place and never aborts the batch.
-    results = await run_pool_actions(rest_pool, _gated_react, offsets, scope=f"chat:{chat_id}")
+    results = await run_pool_actions(rest_pool, _gated_react, offsets)
     await _note_membership(chat_id, ok_ids, [])
     done = success + sum(1 for r in results if r == "ok")
     log(
@@ -2823,209 +2756,6 @@ async def react_post_scheduled(
         f"in {time.monotonic() - started:.0f}s"
     )
     return done
-
-
-async def engage_posts_scheduled(
-    chat_id: int,
-    message_ids: list[int],
-    view_enabled: bool = True,
-    view_min: int = 0,
-    view_max: int = 0,
-    emojis: Optional[list[str]] = None,
-    react_window: float = 0.0,
-    react_min: int = 0,
-    react_max: int = 0,
-    shard_index: int = 0,
-    shard_count: int = 1,
-    member_ids: Optional[list[int]] = None,
-    vote: Optional[dict] = None,
-    vote_sink=None,
-) -> dict:
-    """
-    ONE channel visit per userbot that does EVERYTHING pending for that channel:
-    view + reaction for every new post, plus this account's pending poll vote.
-
-    Why: several posts arriving together used to become several jobs, so the same
-    account opened the same channel again and again and burned a pacing gap each
-    time (and the votes queued behind all of it). Here each account takes a
-    SINGLE turn: it views post #1, reacts to it if it was picked, moves on to
-    post #2, ..., then casts its vote if one is pending — and only then does the
-    next account start after that account's personal gap. Different channels are
-    separate scopes, so they run in parallel.
-
-    `vote` (optional): {"target_id", "message_id", "assignments": {acc_id: option}}
-    `vote_sink` (optional): awaited as vote_sink(target_id, account_id, ok, error).
-
-    The view and reaction "low to high" amounts stay independent per post (each
-    rolled from its own per-post seed, exactly like the separate handlers); the
-    accounts are picked from the SAME shuffled member order so the ones doing
-    both overlap as much as possible.
-    """
-    emojis = emojis or []
-    posts = sorted({int(m) for m in (message_ids or [])})
-    assignments = {int(k): int(v) for k, v in ((vote or {}).get("assignments") or {}).items()}
-    empty = {"views": 0, "reactions": 0, "votes": 0, "accounts": 0, "posts": len(posts)}
-
-    pool = _member_pool(member_ids)
-    if not pool or (not posts and not assignments):
-        return empty
-
-    order = pool[:]
-    random.shuffle(order)
-
-    # Who views / reacts to which post (independent roll per post).
-    viewers: dict[int, set] = {}
-    reactors: dict[int, set] = {}
-    for mid in posts:
-        view_n = (
-            _shard_share(
-                view_min, view_max, f"view:{chat_id}:{mid}:{view_min}:{view_max}",
-                shard_index, shard_count, len(order),
-            )
-            if view_enabled
-            else 0
-        )
-        react_n = (
-            _shard_share(
-                react_min, react_max, f"{chat_id}:{mid}:{react_min}:{react_max}",
-                shard_index, shard_count, len(order),
-            )
-            if emojis
-            else 0
-        )
-        viewers[mid] = {a for a, _ in (order if view_n is None else order[: view_n or 0])}
-        reactors[mid] = {a for a, _ in (order if react_n is None else order[: react_n or 0])}
-
-    sem = _get_action_sem()
-    views = 0
-    reactions = 0
-    votes = 0
-    acted = 0
-    ok_ids: list[int] = []
-    bad_ids: list[int] = []
-    react_blocked = 0
-    react_ok = 0
-    started = time.monotonic()
-    # Reaction pacing preset (fast / medium / slow / custom): spread the visits
-    # over that window when it is WIDER than the natural per-account gaps, so a
-    # "slow" channel still trickles instead of finishing in one go.
-    spread_gap = (react_window / len(order)) if (react_window > 0 and emojis and order) else 0.0
-
-    log(
-        f"[engage] chat {chat_id}: {len(posts)} post(s) {posts or '-'} + "
-        f"{len(assignments)} vote(s) with {len(order)} userbot(s) "
-        f"(view={'on' if view_enabled else 'off'}, emojis={emojis or '-'})"
-    )
-
-    for acc_id, client in order:
-        my_posts = [m for m in posts if acc_id in viewers[m] or acc_id in reactors[m]]
-        option_index = assignments.get(acc_id)
-        if not my_posts and option_index is None:
-            continue
-
-        touched = False
-        not_member = False
-        turn_started = time.monotonic()
-        # ONE turn for this account's whole visit (all posts + its vote). The
-        # gate waits out the previous userbot's personal gap in THIS channel's
-        # scope, so the channel is worked one-by-one while other channels run
-        # in parallel.
-        async with action_turn(acc_id, f"chat:{chat_id}"):
-            for mid in my_posts:
-                if not_member:
-                    break
-                if acc_id in viewers[mid]:
-                    async with sem:
-                        ok, missing = await _view_once(client, chat_id, mid, acc_id)
-                    if ok:
-                        views += 1
-                        touched = True
-                    elif missing:
-                        bad_ids.append(acc_id)
-                        not_member = True
-                        break
-
-                do_react = bool(emojis) and acc_id in reactors[mid]
-                # Reactions turned out to be impossible in this channel (the
-                # first attempts came back blocked): stop trying them, keep
-                # collecting views.
-                if do_react and react_ok == 0 and react_blocked >= 2:
-                    do_react = False
-                if do_react:
-                    async with sem:
-                        kind = await _react_once(client, chat_id, mid, emojis, acc_id)
-                    if kind == "ok":
-                        reactions += 1
-                        react_ok += 1
-                        touched = True
-                    elif kind == "blocked":
-                        react_blocked += 1
-
-            if option_index is not None and not not_member:
-                async with sem:
-                    ok, err = await _vote_once(
-                        client, chat_id, int(vote["message_id"]), option_index, acc_id
-                    )
-                if ok:
-                    votes += 1
-                    touched = True
-                if vote_sink is not None:
-                    try:
-                        await vote_sink(vote.get("target_id"), acc_id, ok, err)
-                    except Exception as e:  # bookkeeping must never break the visit
-                        log(f"[!] vote bookkeeping failed for account {acc_id}: {e}")
-
-        if touched:
-            ok_ids.append(acc_id)
-            acted += 1
-
-        if spread_gap > 0:
-            extra = spread_gap - (time.monotonic() - turn_started)
-            if extra > 0:
-                await asyncio.sleep(extra)
-
-    await _note_membership(chat_id, ok_ids, bad_ids)
-    log(
-        f"[engage] chat {chat_id}: done in {time.monotonic() - started:.0f}s — "
-        f"{views} view(s), {reactions} reaction(s), {votes} vote(s) from {acted} userbot(s)"
-    )
-    return {
-        "views": views,
-        "reactions": reactions,
-        "votes": votes,
-        "accounts": acted,
-        "posts": len(posts),
-    }
-
-
-async def engage_post_scheduled(
-    chat_id: int,
-    message_id: int,
-    view_min: int = 0,
-    view_max: int = 0,
-    emojis: Optional[list[str]] = None,
-    react_window: float = 0.0,
-    react_min: int = 0,
-    react_max: int = 0,
-    shard_index: int = 0,
-    shard_count: int = 1,
-    member_ids: Optional[list[int]] = None,
-) -> dict:
-    """Single-post shortcut for engage_posts_scheduled (view + reaction)."""
-    return await engage_posts_scheduled(
-        chat_id,
-        [message_id],
-        view_enabled=True,
-        view_min=view_min,
-        view_max=view_max,
-        emojis=emojis,
-        react_window=react_window,
-        react_min=react_min,
-        react_max=react_max,
-        shard_index=shard_index,
-        shard_count=shard_count,
-        member_ids=member_ids,
-    )
 
 
 # ===========================================================================

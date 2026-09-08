@@ -65,7 +65,6 @@ export type JobType =
   | "leave_livestream" // leave the live stream
   | "join_channel" // join a channel/group so future view/react/vote actions work
   | "view_post" // view a channel post from every logged-in userbot
-  | "engage_post" // one visit per userbot: view + react to all new posts (+ pending vote)
   | "detect_poll" // read the most recent poll in a channel and fill in vote_targets
   | "cast_vote" // make one userbot vote on a poll option
   | "retract_vote" // make one userbot remove its vote from a poll

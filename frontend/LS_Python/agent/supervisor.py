@@ -44,10 +44,10 @@ import subprocess
 import sys
 import time
 
-# Number of worker processes to run. Default 10 shards: the persistent WebRTC /
-# MTProto work is spread over more processes (each with its own event loop), so
-# a burst on one channel can't stall the others. Each shard should stay under
-# LS_SOFT_MAX_PER_SHARD bots; the worker logs a warning if it goes over.
+# Number of worker processes to run. Default 10 shards: the work is spread over
+# more processes (each with its own event loop), so a burst on one channel can't
+# stall the others. Each shard should stay under LS_SOFT_MAX_PER_SHARD bots; the
+# worker logs a warning if it goes over.
 #
 # NOTE on DB connections: every shard opens its own pool (AGENT_DB_POOL_MAX,
 # default 10), so 10 shards can reach ~100 connections. On a Postgres with
@@ -152,7 +152,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
-    # Initial staggered launch: bringing 10 processes up at the exact same instant
+    # Initial staggered launch: bringing 7 processes up at the exact same instant
     # would create a synchronized burst of logins/joins. A tiny stagger smooths it.
     for s in shards:
         s.start()

@@ -6,8 +6,8 @@ Run with a throwaway database:
       python -m tests.test_db_pacing
 
 It creates a minimal slice of the panel schema (accounts / jobs / vote tables),
-then exercises the queries the agent adds on top of it: the per-task pacing gate,
-the channel membership map, the combined engage job and the pending-vote lookup.
+then exercises the queries the agent relies on: the shared pacing gate, the
+channel membership map, the view/reaction job payloads and the vote bookkeeping.
 """
 
 from __future__ import annotations
@@ -32,7 +32,15 @@ def check(name: str, ok: bool) -> None:
 
 
 def setup_schema() -> None:
-    db.query("DROP TABLE IF EXISTS vote_casts, vote_targets, channel_members, jobs, telegram_accounts, agent_pacing_scopes CASCADE")
+    db.query(
+        "DROP TABLE IF EXISTS vote_casts, vote_targets, channel_members, jobs, "
+        "telegram_accounts, agent_pacing CASCADE"
+    )
+    db.query(
+        "CREATE TABLE agent_pacing (id INTEGER PRIMARY KEY, "
+        "next_start_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+    db.query("INSERT INTO agent_pacing (id) VALUES (1)")
     db.query(
         """
         CREATE TABLE telegram_accounts (
@@ -94,19 +102,17 @@ def setup_schema() -> None:
     db.query("INSERT INTO telegram_accounts (status) SELECT 'logged_in' FROM generate_series(1, 5)")
 
 
-def test_pacing_scopes() -> None:
-    db._PACING_SCOPES_READY = False
-    first = db.reserve_paced_slot(2.0, "join:1")
-    second = db.reserve_paced_slot(2.0, "join:1")
-    third = db.reserve_paced_slot(2.0, "vote:9")
-    check(f"first caller of a scope waits ~0s ({first:.2f})", first < 0.5)
-    check(f"second caller of the SAME scope waits the gap ({second:.2f})", 1.5 <= second <= 2.5)
-    check(f"another task's scope is NOT blocked ({third:.2f})", third < 0.5)
-    # Two callers already queued this scope up to +4s; once that has elapsed the
-    # gate is idle again and a fresh caller starts immediately.
+def test_paced_slot() -> None:
+    """The shared start gate: per-account actions start one-by-one, fleet-wide."""
+    first = db.reserve_paced_slot(2.0)
+    second = db.reserve_paced_slot(2.0)
+    check(f"first caller waits ~0s ({first:.2f})", first < 0.5)
+    check(f"the next caller waits the gap ({second:.2f})", 1.5 <= second <= 2.5)
+    # Two callers already booked the gate up to +4s; once that has elapsed a
+    # fresh caller starts immediately again.
     time.sleep(4.2)
-    again = db.reserve_paced_slot(2.0, "join:1")
-    check(f"an idle scope's gate is free again ({again:.2f})", again < 0.5)
+    again = db.reserve_paced_slot(2.0)
+    check(f"an idle gate is free again ({again:.2f})", again < 0.5)
 
 
 def test_channel_members() -> None:
@@ -122,47 +128,42 @@ def test_channel_members() -> None:
     check("unknown channel -> empty", db.get_channel_member_ids(-100999) == [])
 
 
-def test_engage_job() -> None:
-    db.enqueue_engage_job(-100123, [11, 12, 10], 4, 5, 9, 7, ["🔥"], "medium", 5, 1, 2)
+def test_action_jobs() -> None:
+    db.enqueue_view_job(-100123, 11, 4, 5, 9)
     row = db.query("SELECT type, payload FROM jobs ORDER BY id DESC LIMIT 1")[0]
     payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-    check("engage job queued", row["type"] == "engage_post")
-    check(f"all posts in ONE job, sorted ({payload['message_ids']})", payload["message_ids"] == [10, 11, 12])
-    check("legacy message_id kept", payload["message_id"] == 12)
-    check("targets carried", (payload["view_target_id"], payload["reaction_target_id"]) == (4, 7))
-    db.enqueue_engage_job(-100123, [], 4, 5, 9, 7, [], "medium", 5, 0, 0)
-    count = db.query("SELECT count(*) AS n FROM jobs WHERE type = 'engage_post'")[0]["n"]
-    check("empty post list queues nothing", int(count) == 1)
+    check("view job queued", row["type"] == "view_post")
+    check(f"view payload carries the post + range ({payload})", payload["message_id"] == 11)
+
+    db.enqueue_reaction_job(-100123, 12, 7, ["🔥"], "medium", 5, 1, 2)
+    row = db.query("SELECT type, payload FROM jobs ORDER BY id DESC LIMIT 1")[0]
+    payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+    check("reaction job queued", row["type"] == "react_post")
+    check(f"reaction payload carries emojis + range ({payload})", payload["emojis"] == ["🔥"])
 
 
-def test_pending_vote_lookup() -> None:
+def test_vote_casts() -> None:
     db.query(
         "INSERT INTO vote_targets (id, poll_link, chat_id, message_id, status) "
         "VALUES (1, 'https://t.me/demo/5', -100123, 555, 'ready')"
     )
     db.query(
         "INSERT INTO vote_casts (target_id, account_id, option_index, status) VALUES "
-        "(1, 1, 2, 'pending'), (1, 2, 0, 'pending'), (1, 3, 1, 'voted')"
+        "(1, 1, 2, 'pending'), (1, 2, 0, 'pending')"
     )
-    vote = db.get_pending_vote_for_chat(-100123)
-    check(f"pending vote found ({vote})", vote is not None)
-    check("only PENDING casts are included", vote["assignments"] == {1: 2, 2: 0})
-    check("poll message id carried", vote["message_id"] == 555)
-    check("already voted account status", db.get_vote_cast_status(1, 3) == "voted")
-    check("unknown cast -> None", db.get_vote_cast_status(1, 5) is None)
-
     db.set_vote_cast(1, 1, "voted", None)
-    vote = db.get_pending_vote_for_chat(-100123)
-    check("voted cast drops out of the pending set", vote["assignments"] == {2: 0})
-    db.query("UPDATE vote_casts SET status = 'voted' WHERE target_id = 1")
-    check("nothing pending -> None", db.get_pending_vote_for_chat(-100123) is None)
-    check("other channel -> None", db.get_pending_vote_for_chat(-100777) is None)
+    rows = db.query("SELECT account_id, status FROM vote_casts WHERE target_id = 1 ORDER BY account_id")
+    check(f"cast marked voted ({rows})", rows[0]["status"] == "voted")
+    check("the other cast is untouched", rows[1]["status"] == "pending")
+    db.set_vote_cast(1, 2, "failed", "POLL_OPTION_INVALID")
+    row = db.query("SELECT status, last_error FROM vote_casts WHERE target_id = 1 AND account_id = 2")[0]
+    check(f"failure + reason stored ({row})", row["status"] == "failed" and "POLL" in row["last_error"])
 
 
 if __name__ == "__main__":
     setup_schema()
-    test_pacing_scopes()
+    test_paced_slot()
     test_channel_members()
-    test_engage_job()
-    test_pending_vote_lookup()
+    test_action_jobs()
+    test_vote_casts()
     print("\nALL DB CHECKS PASSED")

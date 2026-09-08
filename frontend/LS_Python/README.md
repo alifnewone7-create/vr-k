@@ -157,36 +157,38 @@ login_pending → login_code → (login_2fa) → logged_in` (or `failed`).
 
 ### How the pacing works (views / reactions / votes)
 
-Two things run at the same time, on purpose:
+**Per-account gap.** Every account has its OWN stable delay window inside
+`AGENT_ACCOUNT_DELAY_MIN`..`AGENT_ACCOUNT_DELAY_MAX` (default **3-20s**), derived
+from its id — account #101 might always rest 4-9s while #102 rests 8-20s. So the
+fleet never ticks like one script on a timer, and an account never fires two
+actions back-to-back.
 
-1. **Per-account gap.** Every account has its OWN stable delay window inside
-   `AGENT_ACCOUNT_DELAY_MIN`..`AGENT_ACCOUNT_DELAY_MAX` (default **3-20s**),
-   derived from its id — account #101 might always rest 4-9s while #102 rests
-   8-20s. So the fleet never ticks like one script on a timer, and an account
-   never fires two actions back-to-back.
+**Inside one post the userbots drip in order**: account acts -> its personal gap
+-> next account acts (`AGENT_SEQUENTIAL_ACTIONS=1`, the default). Different
+tasks (another channel, a poll, a livestream) run at the same time, so a new
+task does not stop the older ones.
 
-2. **One-by-one per TASK, parallel across tasks.** Inside one channel (or one
-   poll, one channel-join task, one DM campaign) the accounts act strictly one
-   after another with that gap. A DIFFERENT task has its own line and runs at the
-   same time — adding a new task never makes the older ones crawl.
-   `AGENT_ACTION_DISPATCH_GAP_MIN/MAX` (default 3-5s) is the start gap inside a
-   task, shared across all shards through `agent_pacing_scopes`.
-   Set `AGENT_GLOBAL_ONE_BY_ONE=1` if you ever want the old single fleet-wide
-   line back (much slower).
+**Per-account jobs** (vote / join / DM / profile) go through a shared DB gate
+(`agent_pacing`), so across ALL shards only one account starts every
+`AGENT_ACTION_DISPATCH_GAP_MIN`..`MAX` seconds (default 3-5s).
 
-**One visit per userbot.** When several posts land together, ONE `engage_post`
-job is queued for the whole batch: each userbot opens the channel once and views
-+ reacts to every new post, and also casts its pending poll vote for that
-channel in the same visit. It never pays the gap twice for the same channel.
+**Only the joined userbots work a channel.** The agent keeps a `channel_members`
+map (chat_id -> account_id). It is written when a bot joins, learned whenever a
+view/reaction succeeds, and pruned when Telegram says an account cannot see the
+channel — so a channel with 50 joined bots always uses those 50, never the whole
+fleet. A channel's id/title is also resolved ONCE and cached
+(`AGENT_CHANNEL_INFO_TTL`, default 1h) instead of on every 5s poll, which is what
+used to earn `FLOOD_WAIT` on `GetFullChannel`.
 
 **Console output.** `AGENT_VERBOSE=1` (default) prints every single action:
 
 ```
-[engage] chat -1001234567890: 3 post(s) [901, 902, 903] + 12 vote(s) with 48 userbot(s)
+[view]  chat -1001234567890 msg #901: starting with 48 userbot(s)
 [view]  chat -1001234567890 msg #901 acct 137 -> OK
 [react] chat -1001234567890 msg #901 acct 137 -> OK 🔥
-[vote]  chat -1001234567890 poll #800 acct 137 -> OK option 2
-[engage] chat -1001234567890: done in 214s — 141 view(s), 44 reaction(s), 12 vote(s) from 48 userbot(s)
+[vote]  poll #800 acct 137 -> OK option 2
+[view]  chat -1001234567890 msg #901: 47/48 view(s) registered in 214s
+[OK] job #5312 view_post -> viewed (views=47 message_id=901)
 ```
 
 Set `AGENT_VERBOSE=0` to keep only the summaries and the errors.

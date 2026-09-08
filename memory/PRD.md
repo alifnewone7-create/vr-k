@@ -23,6 +23,20 @@ Clone https://github.com/alifnewone7-create/a-v-k.git (public), copy all files/f
 - HMR websocket from the preview domain is blocked (allowedDevOrigins wildcard doesn't cover two-level subdomain `avk-preview.cluster-5.preview.emergentcf.cloud`). App works fine; only dev hot-reload affected. Left unchanged per "do not change anything".
 - P0 remaining: none. P1: none requested.
 
+## Reverted to the auto-km agent base + kept the channel cache/membership map (2026-06)
+User instruction: `auto-km/frontend/LS_Python/agent` er file gulo copy kore use koro, **shudhu channel resolve cache + channel_members map rakho**.
+
+- Copied all 7 files of `auto-km/frontend/LS_Python/agent` over `/app/frontend/LS_Python/agent` (fixed the repo's stray `+` on worker.py line 1).
+- Dropped with it (was in the previous a-v-k build): combined `engage_post` job (multi-post + vote in one visit), `engage_posts_scheduled`, scoped `action_turn`, `agent_pacing_scopes` per-task gate, `job_pacing_scope`, `get_pending_vote_for_chat` / `get_vote_cast_status`, `enqueue_engage_job`. `lib/types.ts` reverted (no `engage_post` job type).
+- Re-applied on top (user asked to keep): channel info cache (`_CHANNEL_INFO`, `AGENT_CHANNEL_INFO_TTL`, resolve fast path, cache on join/get_chat, `cached_chat_id`) and the membership map (`channel_members` table + `remember/forget/get_channel_member_ids`, `set_membership_sink`, `_note_membership`, `_is_not_member_error`, `_member_pool`, wired into `view_post_scheduled` / `react_post_scheduled` / `handle_join_channel` / worker `main()`).
+- Kept from the user's earlier explicit asks: `LS_WORKER_SHARDS` default **10**, and the per-action console logs (`[view]/[react]/[vote]` lines + summaries, `AGENT_VERBOSE`, line-buffered stdout in `agent/__init__.py`), `[OK] job ...` lines now carry the counts.
+- Pacing is now purely auto-km's: per-account stable 3-20s window, sequential drip inside one post (`AGENT_SEQUENTIAL_ACTIONS`), single shared `agent_pacing` gate at 3-5s for per-account jobs.
+
+Verification
+- `python -m tests.test_engage_flow` — 30 checks (fake pyrogram): pacing profile, member pool, not-member detection, channel cache, view learns/prunes membership, view amount, reaction flow + blocked-channel probe, shard split of amounts, one-by-one drip, two channels in parallel.
+- `DATABASE_URL=... python -m tests.test_db_pacing` — 15 checks (real Postgres): shared pacing gate, membership map, view/react job payloads, vote cast bookkeeping.
+- `DATABASE_URL=... python -m tests.test_worker_jobs` — real Postgres + fake Telegram: `handle_view_post` / `handle_react_post` use only stored members, learn/prune, bump counters.
+
 ## Agent speed + combined-engagement rework (2026-06, LS_Python)
 User report: "new task ashle ager gulo onek slow kore kaj kore" + wants multi-post/vote done in one channel visit, shard 7 -> 10, and everything visible in the VPS console. Reference repo for pacing logic: https://github.com/alifnewone7-create/auto-km.git (`frontend/LS_Python/agent`).
 

@@ -702,16 +702,6 @@ async def handle_cast_vote(job: dict) -> dict:
     account_id = job["account_id"]
     p = job["payload"]
     target_id = p["target_id"]
-
-    # The userbot may have already cast this vote during a channel visit (the
-    # engage flow votes in the same turn it views/reacts). Nothing left to do.
-    try:
-        if await db.arun(db.get_vote_cast_status, target_id, account_id) == "voted":
-            print(f"[vote] target {target_id} acct {account_id}: already voted during a channel visit", flush=True)
-            return {"stage": "already_voted", "target_id": target_id}
-    except Exception as e:
-        print(f"[!] vote status check failed for account {account_id}: {e}", flush=True)
-
     acc = db.get_account(account_id)
     try:
         await userbot.vote_on_poll(
@@ -799,89 +789,6 @@ async def handle_react_post(job: dict) -> dict:
     if target_id:
         db.bump_reaction_sent(int(target_id), count)
     return {"stage": "reacted", "reactions": count, "message_id": message_id}
-
-
-def _reaction_window(mode: str, custom_minutes: int) -> float:
-    """Seconds the reactions for one post are spread over, per preset/custom."""
-    if mode == "custom":
-        return max(1, int(custom_minutes or 1)) * 60.0
-    return REACTION_WINDOWS.get(mode, REACTION_WINDOWS["medium"])
-
-
-async def handle_engage_post(job: dict) -> dict:
-    """
-    Do EVERYTHING pending for one channel in a SINGLE pass per userbot:
-    view + reaction for every new post, plus that account's pending poll vote.
-
-    Queued whenever a watched channel gets new post(s) — one job for the whole
-    batch of posts, so an account opens the channel once instead of once per
-    post (which is what made a burst of posts crawl). Each account: views/reacts
-    to all the posts it was picked for, votes if it has a pending cast on that
-    channel's poll, and only then does the next account start after its own gap.
-    """
-    p = job["payload"]
-    chat_id = int(p["chat_id"])
-    message_ids = [int(m) for m in (p.get("message_ids") or ([p["message_id"]] if p.get("message_id") else []))]
-    view_target_id = p.get("view_target_id")
-    reaction_target_id = p.get("reaction_target_id")
-    emojis = p.get("emojis") or []
-    if isinstance(emojis, str):
-        import json as _json
-
-        emojis = _json.loads(emojis)
-
-    shard_index = int(p.get("shard_index", SHARD_INDEX) or 0)
-    member_ids = await db.arun(db.get_channel_member_ids, chat_id)
-
-    # Any poll vote still pending on THIS channel? Then the visiting userbots
-    # cast it in the same turn instead of it queueing behind everything else.
-    vote = None
-    try:
-        vote = await db.arun(db.get_pending_vote_for_chat, chat_id)
-        if vote and member_ids:
-            vote["assignments"] = {
-                a: o for a, o in vote["assignments"].items() if a in set(member_ids)
-            }
-            if not vote["assignments"]:
-                vote = None
-    except Exception as e:
-        print(f"[!] pending vote lookup failed for chat {chat_id}: {e}")
-        vote = None
-
-    async def vote_sink(target_id, account_id, ok, error) -> None:
-        await db.arun(
-            db.set_vote_cast, target_id, account_id, "voted" if ok else "pending", error or None
-        )
-
-    result = await userbot.engage_posts_scheduled(
-        chat_id,
-        message_ids,
-        view_enabled=view_target_id is not None,
-        view_min=int(p.get("view_min", 0) or 0),
-        view_max=int(p.get("view_max", 0) or 0),
-        emojis=emojis,
-        react_window=_reaction_window(p.get("mode", "medium"), int(p.get("custom_minutes", 5) or 5)),
-        react_min=int(p.get("react_min", 0) or 0),
-        react_max=int(p.get("react_max", 0) or 0),
-        shard_index=shard_index,
-        shard_count=SHARD_COUNT,
-        member_ids=member_ids,
-        vote=vote,
-        vote_sink=vote_sink if vote else None,
-    )
-
-    if view_target_id and result.get("views"):
-        db.bump_view_sent(int(view_target_id), int(result["views"]))
-    if reaction_target_id and result.get("reactions"):
-        db.bump_reaction_sent(int(reaction_target_id), int(result["reactions"]))
-    return {
-        "stage": "engaged",
-        "views": result.get("views", 0),
-        "reactions": result.get("reactions", 0),
-        "votes": result.get("votes", 0),
-        "accounts": result.get("accounts", 0),
-        "posts": message_ids,
-    }
 
 
 async def handle_update_profile(job: dict) -> dict:
@@ -1173,7 +1080,6 @@ HANDLERS = {
     "cast_vote": handle_cast_vote,
     "retract_vote": handle_retract_vote,
     "react_post": handle_react_post,
-    "engage_post": handle_engage_post,
     "update_profile": handle_update_profile,
     "delete_profile_photos": handle_delete_profile_photos,
     "send_dm": handle_send_dm,
@@ -1238,32 +1144,6 @@ def _get_paced_queue() -> "asyncio.Queue[dict]":
     return _paced_queue
 
 
-def job_pacing_scope(job: dict) -> str:
-    """
-    Which one-by-one line this per-account job belongs to.
-
-    Every TASK gets its own line (a channel-join task, a poll, a livestream, a DM
-    campaign, profile edits), so the accounts of one task start one-by-one with
-    the configured gap while a DIFFERENT task runs at the same time instead of
-    queueing behind it. That is what keeps an older task fast when a new one is
-    added.
-    """
-    p = job.get("payload") or {}
-    jtype = job["type"]
-    target = p.get("target_id")
-    if jtype in ("cast_vote", "retract_vote", "detect_poll"):
-        return f"vote:{target}"
-    if jtype == "join_channel":
-        return f"join:{target}"
-    if jtype in ("join_livestream", "leave_livestream"):
-        return f"live:{target}"
-    if jtype == "send_dm":
-        return f"dm:{p.get('campaign_id') or target or 'single'}"
-    if jtype in ("update_profile", "delete_profile_photos"):
-        return "profile"
-    return f"{jtype}:{target}" if target else jtype
-
-
 async def paced_dispatcher() -> None:
     """
     Start per-account action jobs ONE AT A TIME.
@@ -1283,20 +1163,19 @@ async def paced_dispatcher() -> None:
     while True:
         job = await q.get()
         try:
-            # Reserve the next start slot for THIS job's task scope. The gate is
-            # a shared DB row per scope, so even with 10 shards only ONE account
-            # of that task starts per gap across the whole fleet — while other
-            # tasks keep running in parallel on their own scope (a new task no
-            # longer makes the older ones crawl). The gap is randomized so the
+            # Reserve the next GLOBAL start slot before launching. This is a
+            # SHARED DB gate, so even with 7 shards each running their own
+            # dispatcher, only ONE account across the WHOLE fleet starts per gap —
+            # true one-by-one, not "one per shard at the same instant" (which was
+            # why it still looked like a burst). The gap is randomized so the
             # fleet doesn't tick like a metronome.
             gap = random.uniform(ACTION_DISPATCH_GAP_MIN, ACTION_DISPATCH_GAP_MAX)
-            scope = job_pacing_scope(job)
             try:
-                wait = await db.arun(db.reserve_paced_slot, gap, scope)
+                wait = await db.arun(db.reserve_paced_slot, gap)
             except Exception as e:
                 # If the gate is unreachable, fall back to a local gap so we still
                 # pace (just per-shard) instead of bursting.
-                print(f"[!] paced gate unavailable ({e}); using local gap", flush=True)
+                print(f"[!] paced gate unavailable ({e}); using local gap")
                 wait = gap
             if wait and wait > 0:
                 await asyncio.sleep(wait)
@@ -1321,8 +1200,8 @@ async def process_one(job: dict) -> None:
     try:
         if paced:
             # Serialize this account's actions and honor its personal pacing
-            # window so it never fires back-to-back. The one-by-one spacing
-            # across accounts is already handled by paced_dispatcher's shared slot.
+            # window so it never fires back-to-back. Different accounts still run
+            # fully in parallel — the lock is per account.
             async with userbot._get_account_lock(acct):
                 await userbot.account_gate(acct)
                 result = await handler(job)
@@ -1489,18 +1368,13 @@ async def dispatch_views_for_target(
     view_max: int = 0,
 ) -> None:
     """
-    Atomically claim the new post range and queue one job per post.
+    Atomically claim the new post range and queue one view_post job per post.
     Safe to call from both the polling loop and the live handler - claim_view_advance
     guarantees each post is only dispatched once.
 
-    When the SAME channel also has an active reaction task, we claim that task's
-    range too and queue ONE combined `engage_post` job per post instead of a
-    separate view + reaction job, so each account handles the post in a single
-    visit (view then react) rather than twice.
-
     view_min/view_max are the channel's "low to high" per-post view range; they are
-    carried onto every job so the agent views from only a random subset of
-    userbots (a gradually climbing count) instead of the whole pool.
+    carried onto every view_post job so the agent views from only a random subset
+    of userbots (a gradually climbing count) instead of the whole pool.
     """
     old = db.claim_view_advance(target_id, latest_id)
     if old is None:
@@ -1509,58 +1383,10 @@ async def dispatch_views_for_target(
     post_ids = list(range(start, latest_id + 1))
     if not post_ids:
         return
-
-    # Same channel also auto-reacting? Then claim its range as well and run both
-    # actions together. claim_reaction_advance is atomic, so the reaction poller
-    # simply finds nothing left to do for these posts (no double work).
-    reaction = None
-    try:
-        rt = db.get_reaction_target_by_chat(chat_id)
-        if rt and rt["status"] == "active" and rt["last_seen_message_id"] != 0:
-            if db.claim_reaction_advance(rt["id"], latest_id) is not None:
-                reaction = rt
-    except Exception as e:
-        print(f"[!] combined view+reaction lookup failed for chat {chat_id}: {e}")
-
-    if reaction is not None:
-        emojis = reaction.get("emojis") or []
-        if isinstance(emojis, str):
-            import json as _json
-
-            emojis = _json.loads(emojis)
-        db.enqueue_engage_job(
-            chat_id,
-            post_ids,
-            target_id,
-            view_min,
-            view_max,
-            reaction["id"],
-            emojis,
-            reaction.get("mode", "medium"),
-            int(reaction.get("custom_minutes", 5) or 5),
-            int(reaction.get("react_min", 0) or 0),
-            int(reaction.get("react_max", 0) or 0),
-        )
-        db.bump_view_posts(target_id, len(post_ids))
-        db.bump_reaction_posts(reaction["id"], len(post_ids))
-        print(
-            f"[engage] chat {chat_id}: queued {len(post_ids)} post(s) up to #{latest_id} "
-            f"(view + reaction + any pending vote in ONE visit per account)",
-            flush=True,
-        )
-        return
-
-    # View only: still ONE job for the whole batch of posts, so an account opens
-    # the channel once and views all the new posts in a single visit.
-    db.enqueue_engage_job(
-        chat_id, post_ids, target_id, view_min, view_max, None, [], "medium", 5, 0, 0
-    )
+    for mid in post_ids:
+        db.enqueue_view_job(chat_id, mid, target_id, view_min, view_max)
     db.bump_view_posts(target_id, len(post_ids))
-    print(
-        f"[view] target {target_id}: queued {len(post_ids)} new post(s) up to #{latest_id} "
-        f"(one visit per account)",
-        flush=True,
-    )
+    print(f"[view] target {target_id}: queued {len(post_ids)} new post(s) up to #{latest_id}")
 
 
 async def remember_membership(chat_id: int, member_ids: list[int], non_member_ids: list[int]) -> None:
@@ -1576,7 +1402,7 @@ async def remember_membership(chat_id: int, member_ids: list[int], non_member_id
         if non_member_ids:
             await db.arun(db.forget_channel_members, chat_id, non_member_ids)
     except Exception as e:
-        print(f"[!] membership update failed for chat {chat_id}: {e}")
+        print(f"[!] membership update failed for chat {chat_id}: {e}", flush=True)
 
 
 async def live_view_dispatch(chat_id: int, message_id: int) -> None:
@@ -1683,28 +1509,10 @@ async def dispatch_reactions_for_target(target: dict, chat_id: int, latest_id: i
     react_min = int(target.get("react_min", 0) or 0)
     react_max = int(target.get("react_max", 0) or 0)
 
-    # ONE job for the whole batch of posts: each account opens the channel once,
-    # reacts to every new post (and casts any pending vote for that channel) in a
-    # single visit, instead of one job — and one gap — per post.
-    db.enqueue_engage_job(
-        chat_id,
-        post_ids,
-        None,
-        0,
-        0,
-        target["id"],
-        emojis,
-        mode,
-        custom_minutes,
-        react_min,
-        react_max,
-    )
+    for mid in post_ids:
+        db.enqueue_reaction_job(chat_id, mid, target["id"], emojis, mode, custom_minutes, react_min, react_max)
     db.bump_reaction_posts(target["id"], len(post_ids))
-    print(
-        f"[react] target {target['id']}: queued {len(post_ids)} new post(s) up to #{latest_id} "
-        f"(one visit per account)",
-        flush=True,
-    )
+    print(f"[react] target {target['id']}: queued {len(post_ids)} new post(s) up to #{latest_id}")
 
 
 async def live_reaction_dispatch(chat_id: int, message_id: int) -> None:
@@ -1851,12 +1659,6 @@ async def main() -> None:
         db.ensure_channel_members_table()
     except Exception as e:
         print(f"[!] channel_members table setup failed: {e}", flush=True)
-
-    # Per-task pacing gate (one-by-one inside a task, tasks run in parallel).
-    try:
-        db.ensure_pacing_scopes_table()
-    except Exception as e:
-        print(f"[!] agent_pacing_scopes table setup failed: {e}", flush=True)
 
     # Heartbeat once RIGHT NOW so the website shows the agent as online before we
     # spend any time connecting userbots.

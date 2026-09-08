@@ -1,5 +1,5 @@
 """
-Offline checks for the pacing / channel-cache / combined-engagement logic.
+Offline checks for the pacing / channel-cache / membership-map logic.
 
 Pyrogram + pytgcalls are NOT installed here (they only live on the VPS), so the
 telegram libs are stubbed and the agent's pure logic is exercised with fake
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import time
 import types
 from unittest.mock import MagicMock
 
@@ -48,6 +47,8 @@ from agent import userbot  # noqa: E402
 userbot.Client = MagicMock  # type: ignore[assignment]
 # Raw TL constructor -> plain dict so the fake client can be invoked.
 userbot.GetMessagesViews = lambda **kw: kw  # type: ignore[assignment]
+
+_REAL_PACING_DELAY = userbot._account_pacing_delay
 
 
 class FakeClient:
@@ -103,14 +104,10 @@ def check(name: str, ok: bool) -> None:
         raise SystemExit(1)
 
 
-_REAL_PACING_DELAY = userbot._account_pacing_delay
-
-
 def _fast_pacing(gap: float = 0.0) -> None:
     """Force a tiny fixed pacing gap so the tests run instantly."""
     userbot._account_pacing_delay = lambda _acc, _gap=gap: _gap  # type: ignore[assignment]
     userbot._ACCOUNT_NEXT_FREE.clear()
-    userbot._SCOPE_NEXT_FREE.clear()
 
 
 def _real_pacing() -> None:
@@ -119,23 +116,16 @@ def _real_pacing() -> None:
 
 def test_pacing_profile() -> None:
     _real_pacing()
-    check("delay window defaults to 3-20s", (userbot.ACCOUNT_DELAY_MIN, userbot.ACCOUNT_DELAY_MAX) == (3.0, 20.0))
+    check(
+        "delay window defaults to 3-20s",
+        (userbot.ACCOUNT_DELAY_MIN, userbot.ACCOUNT_DELAY_MAX) == (3.0, 20.0),
+    )
     delays = [userbot._account_pacing_delay(i) for i in range(1, 60)]
     check("no pacing delay is below the 3s floor", all(d >= 3.0 for d in delays))
     prof = userbot._account_delay_profile(101)
     check("an account's window is STABLE", prof == userbot._account_delay_profile(101))
     windows = {userbot._account_delay_profile(i) for i in range(1, 30)}
     check(f"different accounts get different windows ({len(windows)} of 29)", len(windows) > 20)
-
-
-def test_shard_share() -> None:
-    check("view_max=0 means everyone", userbot._shard_share(0, 0, "k", 0, 1, 10) is None)
-    n = userbot._shard_share(5, 5, "k", 0, 1, 50)
-    check("fixed range gives exact count", n == 5)
-    shares = [userbot._shard_share(7, 7, "k", i, 3, 50) for i in range(3)]
-    check(f"shares split across shards sum to total ({shares})", sum(shares) == 7)
-    capped = userbot._shard_share(40, 40, "k", 0, 1, 6)
-    check("count is capped by the member pool", capped == 6)
 
 
 def test_member_pool() -> None:
@@ -146,6 +136,21 @@ def test_member_pool() -> None:
     pool = userbot._member_pool([2, 3, 99])
     check("member map filters the pool", sorted(a for a, _ in pool) == [2, 3])
     check("members warm on another shard -> empty", userbot._member_pool([99]) == [])
+
+
+def test_not_member_detection() -> None:
+    check(
+        "CHANNEL_PRIVATE means not a member",
+        userbot._is_not_member_error(RuntimeError("[400 CHANNEL_PRIVATE] the channel is private")),
+    )
+    check(
+        "USER_BANNED_IN_CHANNEL means not a member",
+        userbot._is_not_member_error(RuntimeError("[400 USER_BANNED_IN_CHANNEL]")),
+    )
+    check(
+        "a flood wait is NOT a membership problem",
+        not userbot._is_not_member_error(RuntimeError("[420 FLOOD_WAIT_X] wait 30 seconds")),
+    )
 
 
 def test_channel_cache() -> None:
@@ -161,14 +166,11 @@ def test_channel_cache() -> None:
     c.calls.clear()
     chat_id2, title2, latest2 = asyncio.run(userbot.resolve_channel_latest("t.me/demo"))
     check("cached resolve returns the same info", (chat_id2, title2, latest2) == (chat_id, title, 42))
-    check(
-        "cached resolve makes NO GetFullChannel call",
-        c.calls == ["history"],
-    )
+    check("cached resolve makes NO GetFullChannel call", c.calls == ["history"])
     check("cached_chat_id() exposes the id", userbot.cached_chat_id("t.me/demo") == -100123)
 
 
-def test_engage_one_visit() -> None:
+def test_view_uses_members_and_learns() -> None:
     userbot._POOL.clear()
     clients = {}
     for i in (1, 2, 3):
@@ -188,141 +190,114 @@ def test_engage_one_visit() -> None:
 
     userbot.set_membership_sink(sink)
 
-    result = asyncio.run(
-        userbot.engage_post_scheduled(
-            -100123,
-            555,
-            emojis=["👍"],
-            member_ids=[1, 2, 3, 4],
-        )
-    )
-    check(f"3 members viewed ({result})", result["views"] == 3)
-    check("3 members reacted", result["reactions"] == 3)
-    for i in (1, 2, 3):
-        check(f"account {i} viewed then reacted in ONE visit", clients[i].calls == ["view", "react"])
-    check("non-member did not get a reaction attempt", clients[4].calls == ["view"])
+    count = asyncio.run(userbot.view_post_scheduled(-100123, 555, 0.0, member_ids=[1, 2, 3, 4]))
+    check(f"3 members viewed ({count})", count == 3)
     check("membership learned for the 3 real members", seen["ok"] == [1, 2, 3])
     check("non-member pruned from the map", seen["bad"] == [4])
+    check("the sink got the right channel", seen["chat_id"] == -100123)
+
+    # Only the stored members are used, never the whole fleet.
+    for c in clients.values():
+        c.calls.clear()
+    count = asyncio.run(userbot.view_post_scheduled(-100123, 556, 0.0, member_ids=[1, 2]))
+    check(f"only the 2 stored members viewed ({count})", count == 2)
+    check("account 3 was not touched", clients[3].calls == [])
     _real_pacing()
 
 
-def test_engage_respects_amounts() -> None:
+def test_view_respects_amount() -> None:
     userbot._POOL.clear()
     for i in range(1, 11):
         userbot._POOL[i] = {"client": FakeClient(i)}
     _fast_pacing()
     userbot.set_membership_sink(None)
-
-    result = asyncio.run(
-        userbot.engage_post_scheduled(
-            -100123,
-            777,
-            view_min=4,
-            view_max=4,
-            emojis=["🔥"],
-            react_min=2,
-            react_max=2,
-            member_ids=list(range(1, 11)),
-        )
+    count = asyncio.run(
+        userbot.view_post_scheduled(-100123, 777, 0.0, 4, 4, 0, 1, list(range(1, 11)))
     )
-    check(f"exactly 4 views ({result})", result["views"] == 4)
-    check("exactly 2 reactions", result["reactions"] == 2)
+    check(f"exactly 4 views for view_min=view_max=4 ({count})", count == 4)
     _real_pacing()
 
 
-def test_multi_post_single_visit() -> None:
-    """3 posts arriving together = ONE visit per account, not 3."""
+def test_react_flow() -> None:
     userbot._POOL.clear()
     clients = {}
-    for i in (1, 2):
-        clients[i] = FakeClient(i)
-        userbot._POOL[i] = {"client": clients[i]}
-    _fast_pacing(0.3)
-    userbot.set_membership_sink(None)
-
-    started = time.monotonic()
-    result = asyncio.run(
-        userbot.engage_posts_scheduled(-100123, [901, 902, 903], emojis=["👍"], member_ids=[1, 2])
-    )
-    elapsed = time.monotonic() - started
-
-    check(f"all 3 posts viewed by both accounts ({result})", result["views"] == 6)
-    check("all 3 posts reacted by both accounts", result["reactions"] == 6)
-    check("2 accounts acted", result["accounts"] == 2)
-    for i in (1, 2):
-        check(
-            f"account {i} did every post inside one visit",
-            clients[i].calls == ["view", "react", "view", "react", "view", "react"],
-        )
-    # One gap per ACCOUNT (2 turns), not one per account-per-post (6 turns).
-    check(f"only 2 pacing gaps were paid ({elapsed:.2f}s)", elapsed < 0.3 * 4)
-    _real_pacing()
-
-
-def test_vote_in_same_visit() -> None:
-    """A pending poll vote is cast during the same channel visit."""
-    userbot._POOL.clear()
-    clients = {}
-    for i in (1, 2):
+    for i in (1, 2, 3, 4):
         clients[i] = FakeClient(i)
         userbot._POOL[i] = {"client": clients[i]}
     _fast_pacing()
-    userbot.set_membership_sink(None)
 
-    recorded: list = []
+    seen: dict = {}
 
-    async def vote_sink(target_id, account_id, ok, error):
-        recorded.append((target_id, account_id, ok, error))
+    async def sink(chat_id, ok_ids, bad_ids):
+        seen["ok"] = ok_ids
 
-    result = asyncio.run(
-        userbot.engage_posts_scheduled(
-            -100123,
-            [910],
-            emojis=[],
-            member_ids=[1, 2],
-            vote={"target_id": 7, "message_id": 800, "assignments": {1: 2, 2: 0}},
-            vote_sink=vote_sink,
-        )
+    userbot.set_membership_sink(sink)
+    count = asyncio.run(
+        userbot.react_post_scheduled(-100123, 601, ["🔥"], 0.0, 0, 0, 0, 1, [1, 2, 3, 4])
     )
-    check(f"both accounts voted ({result})", result["votes"] == 2)
-    check("account 1 viewed then voted in one visit", clients[1].calls == ["view", "vote:2"])
-    check("account 2 voted its own option", clients[2].calls == ["view", "vote:0"])
-    check(f"the vote result was reported back ({recorded})", sorted(r[1] for r in recorded) == [1, 2])
-    check("every reported vote succeeded", all(r[2] for r in recorded))
+    check(f"every member reacted ({count})", count == 4)
+    check("reactors are learned as members", seen["ok"] == [1, 2, 3, 4])
+
+    # Channel with reactions disabled: the 2 probes are blocked and the rest is
+    # skipped instead of hammering the post.
+    userbot._POOL.clear()
+    blocked = {}
+    for i in (1, 2, 3, 4, 5):
+        blocked[i] = FakeClient(i, can_react=False)
+        userbot._POOL[i] = {"client": blocked[i]}
+    count = asyncio.run(
+        userbot.react_post_scheduled(-100123, 602, ["🔥"], 0.0, 0, 0, 0, 1, [1, 2, 3, 4, 5])
+    )
+    check(f"blocked channel -> 0 reactions ({count})", count == 0)
+    tried = sum(1 for c in blocked.values() if c.calls)
+    check(f"only the 2 probes were tried, not all 5 ({tried})", tried == 2)
     _real_pacing()
 
 
-def test_same_chat_keeps_the_gap() -> None:
-    """Two jobs on the SAME channel still act one-by-one with the gap."""
+def test_react_amount_split_across_shards() -> None:
     userbot._POOL.clear()
-    stamps: dict[int, list[float]] = {1: [], 2: []}
+    for i in range(1, 21):
+        userbot._POOL[i] = {"client": FakeClient(i)}
+    _fast_pacing()
+    userbot.set_membership_sink(None)
+    totals = []
+    for shard in range(3):
+        totals.append(
+            asyncio.run(
+                userbot.react_post_scheduled(
+                    -100123, 900, ["👍"], 0.0, 7, 7, shard, 3, list(range(1, 21))
+                )
+            )
+        )
+    check(f"3 shards together send exactly 7 reactions ({totals})", sum(totals) == 7)
+    _real_pacing()
+
+
+def test_accounts_act_one_by_one() -> None:
+    """Inside one post the userbots drip in order, each after its own gap."""
+    userbot._POOL.clear()
+    stamps: list[tuple[int, float]] = []
 
     class StampClient(FakeClient):
         async def invoke(self, _query):
-            stamps[self.acc_id].append(asyncio.get_running_loop().time())
+            stamps.append((self.acc_id, asyncio.get_running_loop().time()))
             return True
 
-    for i in (1, 2):
+    for i in (1, 2, 3):
         userbot._POOL[i] = {"client": StampClient(i)}
 
     gap = 0.3
     _fast_pacing(gap)
     userbot.set_membership_sink(None)
-
-    async def _both():
-        await asyncio.gather(
-            userbot.engage_posts_scheduled(-100123, [901], emojis=[], member_ids=[1, 2]),
-            userbot.engage_posts_scheduled(-100123, [902], emojis=[], member_ids=[1, 2]),
-        )
-
-    asyncio.run(_both())
-    ok = all(len(v) == 2 and (v[1] - v[0]) >= gap * 0.9 for v in stamps.values())
-    check(f"same account's two posts are >= gap apart ({stamps})", ok)
+    asyncio.run(userbot.view_post_scheduled(-100123, 700, 0.0, member_ids=[1, 2, 3]))
+    check(f"all 3 acted ({stamps})", len(stamps) == 3)
+    ok = all(stamps[i + 1][1] - stamps[i][1] >= gap * 0.9 for i in range(len(stamps) - 1))
+    check("each userbot acted at least one gap after the previous one", ok)
     _real_pacing()
 
 
-def test_other_channels_run_in_parallel() -> None:
-    """A second channel must NOT queue behind the first one's whole run."""
+def test_two_channels_run_in_parallel() -> None:
+    """A second channel's task must not queue behind the first one's whole run."""
     userbot._POOL.clear()
     for i in range(1, 5):
         userbot._POOL[i] = {"client": FakeClient(i)}
@@ -333,27 +308,26 @@ def test_other_channels_run_in_parallel() -> None:
     async def _two_channels():
         started = asyncio.get_running_loop().time()
         await asyncio.gather(
-            userbot.engage_posts_scheduled(-100111, [1], emojis=[], member_ids=[1, 2, 3, 4]),
-            userbot.engage_posts_scheduled(-100222, [1], emojis=[], member_ids=[1, 2, 3, 4]),
+            userbot.view_post_scheduled(-100111, 1, 0.0, member_ids=[1, 2, 3, 4]),
+            userbot.view_post_scheduled(-100222, 1, 0.0, member_ids=[1, 2, 3, 4]),
         )
         return asyncio.get_running_loop().time() - started
 
     elapsed = asyncio.run(_two_channels())
-    # Serialised fleet-wide it would be ~8 turns (8 x gap). In parallel scopes
-    # it is ~4 turns, plus each account's own gap between its two channels.
+    # Serialised fleet-wide this would take ~8 gaps; in parallel it is ~4.
     check(f"two channels finish in parallel ({elapsed:.2f}s < {gap * 7:.2f}s)", elapsed < gap * 7)
     _real_pacing()
 
 
 if __name__ == "__main__":
     test_pacing_profile()
-    test_shard_share()
     test_member_pool()
+    test_not_member_detection()
     test_channel_cache()
-    test_engage_one_visit()
-    test_engage_respects_amounts()
-    test_multi_post_single_visit()
-    test_vote_in_same_visit()
-    test_same_chat_keeps_the_gap()
-    test_other_channels_run_in_parallel()
+    test_view_uses_members_and_learns()
+    test_view_respects_amount()
+    test_react_flow()
+    test_react_amount_split_across_shards()
+    test_accounts_act_one_by_one()
+    test_two_channels_run_in_parallel()
     print("\nALL CHECKS PASSED")
